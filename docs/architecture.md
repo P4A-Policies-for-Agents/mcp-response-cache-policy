@@ -7,10 +7,11 @@
 - **Target PDK:** 1.9.2 (common floor on crates.io `cargo-anypoint` and PDK release notes)
 - **Category:** MCP · `assetTypes: mcp` · `interfaceScope: api`
 
-> This document is the approved design for the policy. The repository currently
-> ships the scaffold (repo shape, config schema, MCP JSON-RPC parsing); the
-> cache lookup/store lifecycle described in §4–§5 is implemented in the
-> follow-up implementation phase.
+> This document is the approved design for the policy, now fully implemented:
+> the cache lookup/store lifecycle described in §4–§5 is in place, covered by
+> unit tests and by pdk-test integration tests that exercise a real Flex
+> Gateway (discovery miss→hit, `cache-control: no-cache` bypass, and an
+> allowlisted read-only `tools/call` round-trip).
 
 ## 1. Problem & Goal
 

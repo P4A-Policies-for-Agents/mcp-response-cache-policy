@@ -41,7 +41,6 @@ curl -sD- http://localhost:8081/post \
 ```
 
 Inspect the `x-mcp-cache: hit | miss | bypass` response header to confirm cache
-behavior.
-
-> The current scaffold passes traffic through (fail-open) and does not yet emit
-> cache hits; full lifecycle lands in the implementation phase.
+behavior: the first `tools/list` returns `miss`, an identical follow-up returns
+`hit` (served locally, not forwarded upstream), and a request carrying
+`cache-control: no-cache` returns `bypass`.

@@ -7,10 +7,12 @@ cuts latency, upstream load, and per-call cost for the naturally repetitive
 traffic agents generate — using standard PDK primitives only: **no Redis, no
 external dependency.**
 
-> **Status:** scaffold. The repository shape, configuration schema, and MCP
-> JSON-RPC parsing are in place and the crate builds; the cache lookup/store
-> lifecycle is implemented in the follow-up implementation phase. See
-> [`docs/architecture.md`](docs/architecture.md) for the full design.
+> **Status:** implemented. The full cache lookup/store lifecycle is in place —
+> MCP JSON-RPC parsing, SHA-256 keying, local and gossip-distributed backends,
+> discovery + allowlisted read-only `tools/call` caching, and the annotation
+> guardrail — covered by unit tests and by pdk-test integration tests against a
+> real Flex Gateway. See [`docs/architecture.md`](docs/architecture.md) for the
+> full design.
 
 ## Why
 

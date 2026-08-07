@@ -41,7 +41,16 @@ run: build  ## Run the policy in local flex
 
 .PHONY: test
 test: build ## Run integration tests
-	@cargo test -- --nocapture
+	@rm -rf ./policies_config
+	@anypoint-cli-v4 pdk install-policy --target ./policies_config --path $(BUILD_POLICY_DIR)/$(CRATE_NAME)/implementation/
+	@export POLICY_REF_NAME=$(POLICY_REF_NAME); cargo test -- --nocapture --test-threads=1
+
+.PHONY: test-ci
+test-ci: build ## Run integration tests for CI (no anypoint-cli-v4 dependency)
+	@rm -rf ./policies_config
+	@mkdir -p ./policies_config
+	@cp -r $(BUILD_POLICY_DIR)/$(CRATE_NAME)/implementation/* ./policies_config/
+	@export POLICY_REF_NAME=$(POLICY_REF_NAME); cargo test -- --nocapture --test-threads=1
 
 .PHONY: publish
 publish: build-asset-files build ## Publish a development version of the policy
