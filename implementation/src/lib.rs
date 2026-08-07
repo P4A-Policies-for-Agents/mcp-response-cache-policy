@@ -6,11 +6,12 @@
 // read-only tools/call) at the gateway so repeated agent calls are served
 // locally instead of re-hitting the upstream MCP server.
 //
-// This entrypoint is the scaffold: it parses configuration, wires the
-// request/response filters, and currently passes traffic through (fail-open).
-// The cache lookup / store lifecycle, key construction, guardrails, and the
-// CacheStore backends are implemented in the follow-up implementation phase —
-// see docs/architecture.md and the modules below.
+// Lifecycle: the request filter parses the JSON-RPC envelope, decides
+// cacheability (config allowlist + discovery toggle + guardrails), builds a
+// SHA-256 key, and on a hit short-circuits with the stored result re-stamped to
+// the live request id; on a miss it threads a MissCtx to the response filter,
+// which parses the response and stores it. All filter code is generic over the
+// CacheStore trait; the backend (local vs gossip) is chosen once in configure().
 
 mod annotations;
 mod generated;
@@ -18,35 +19,293 @@ mod key;
 mod mcp;
 mod store;
 
-use crate::generated::config::Config;
+use crate::generated::config::{CacheScope, Config, ToolConfig};
+use crate::key::{cache_key, Identity};
+use crate::mcp::{
+    is_cacheable_response, is_discovery_method, is_notification, parse_request, restamp_id,
+    McpRequest, TOOLS_CALL, TOOLS_LIST,
+};
+use crate::store::{now_secs, CacheStore, CachedEntry, GossipStore, LocalStore};
 use anyhow::{anyhow, Result};
+use pdk::cache::CacheBuilder;
+use pdk::data_storage::DataStorageBuilder;
 use pdk::hl::*;
 use pdk::logger;
+use std::collections::HashMap;
+use std::rc::Rc;
 
 const POLICY_NAME: &str = "mcp-response-cache-policy";
+const CACHE_ID: &str = "mcp-response-cache";
+const HEADER: &str = "x-mcp-cache";
 
-/// Request filter. Fail-open scaffold: recognise MCP JSON-RPC traffic and log,
-/// but pass everything through until the cache lifecycle lands.
-async fn request_filter(request_state: RequestState, _config: &Config) -> Flow<()> {
+/// Disposition threaded to the response filter and used to stamp `x-mcp-cache`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Disposition {
+    Miss,
+    Bypass,
+}
+
+impl Disposition {
+    fn header_value(self) -> &'static str {
+        match self {
+            Disposition::Miss => "miss",
+            Disposition::Bypass => "bypass",
+        }
+    }
+}
+
+/// Context carried from request filter to response filter on a non-hit.
+#[derive(Clone)]
+struct MissCtx {
+    disposition: Disposition,
+    /// Present only when disposition == Miss and the response should be stored.
+    key: Option<String>,
+    ttl: u64,
+    /// Method string, so the response filter can observe tools/list annotations.
+    method: String,
+}
+
+impl MissCtx {
+    fn bypass(method: String) -> Self {
+        Self {
+            disposition: Disposition::Bypass,
+            key: None,
+            ttl: 0,
+            method,
+        }
+    }
+}
+
+/// Immutable per-worker view of config, precomputed for O(1) tool lookup.
+struct Policy {
+    discovery_cacheable: bool,
+    discovery_ttl: u64,
+    tools: HashMap<String, ToolConfig>,
+}
+
+impl Policy {
+    fn new(config: &Config) -> Self {
+        let tools = config
+            .tools
+            .iter()
+            .cloned()
+            .map(|t| (t.name.clone(), t))
+            .collect();
+        Self {
+            discovery_cacheable: config.discovery.cacheable && config.discovery.ttl > 0,
+            discovery_ttl: config.discovery.ttl,
+            tools,
+        }
+    }
+}
+
+/// Decision for a parsed request: cache under `key`/`ttl`, or bypass.
+enum Decision {
+    Cache { key: String, ttl: u64 },
+    Bypass,
+}
+
+async fn decide<S: CacheStore>(
+    policy: &Policy,
+    store: &S,
+    req: &McpRequest,
+    params: &serde_json::Value,
+    identity: &Identity<'_>,
+) -> Decision {
+    // Notifications and unknown methods never cache.
+    if is_notification(&req.method) {
+        return Decision::Bypass;
+    }
+
+    let (ttl, scope) = if is_discovery_method(&req.method) {
+        if !policy.discovery_cacheable {
+            return Decision::Bypass;
+        }
+        (policy.discovery_ttl, CacheScope::Shared)
+    } else if req.method == TOOLS_CALL {
+        let name = match &req.tool_name {
+            Some(n) => n,
+            None => return Decision::Bypass,
+        };
+        let tool = match policy.tools.get(name) {
+            Some(t) if t.cacheable => t,
+            _ => return Decision::Bypass,
+        };
+        // Defense-in-depth: refuse a tool observed destructive even if allowlisted.
+        if crate::annotations::is_known_unsafe(store, name).await {
+            return Decision::Bypass;
+        }
+        (tool.ttl, tool.scope.clone())
+    } else {
+        return Decision::Bypass;
+    };
+
+    match cache_key(&req.method, params, scope, identity) {
+        Some(key) => Decision::Cache { key, ttl },
+        None => Decision::Bypass, // identity scope with no principal/session
+    }
+}
+
+async fn request_filter<S: CacheStore>(
+    request_state: RequestState,
+    policy: &Policy,
+    store: &S,
+) -> Flow<MissCtx> {
     let headers_state = request_state.into_headers_state().await;
     let handler = headers_state.handler();
 
-    // Only POST + JSON is a caching candidate; anything else passes through.
-    let method = handler.header(":method").unwrap_or_default();
-    let content_type = handler.header("content-type").unwrap_or_default();
-    if method != "POST" || !content_type.contains("json") {
-        return Flow::Continue(());
+    // Recognition: only POST + JSON is a candidate.
+    if headers_state.method().as_str() != "POST" {
+        return Flow::Continue(MissCtx::bypass(String::new()));
+    }
+    match handler.header("content-type") {
+        Some(ct) if ct.contains("json") => {}
+        _ => return Flow::Continue(MissCtx::bypass(String::new())),
     }
 
-    logger::debug!("[{}] MCP JSON-RPC candidate observed", POLICY_NAME);
-    Flow::Continue(())
+    // Transport-level bypass hint.
+    if handler
+        .header("cache-control")
+        .map(|v| v.contains("no-cache"))
+        .unwrap_or(false)
+    {
+        return Flow::Continue(MissCtx::bypass(String::new()));
+    }
+
+    // Capture identity headers before consuming the state for the body.
+    let principal = handler.header("x-forwarded-user");
+    let session = handler.header("mcp-session-id");
+
+    let body_state = headers_state.into_body_state().await;
+    let body = body_state.handler().body();
+
+    let req = match parse_request(&body) {
+        Some(r) => r,
+        None => return Flow::Continue(MissCtx::bypass(String::new())), // not MCP JSON-RPC
+    };
+
+    // params for keying (default to null when absent).
+    let params: serde_json::Value = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v.get("params").cloned())
+        .unwrap_or(serde_json::Value::Null);
+
+    let identity = Identity {
+        principal: principal.as_deref(),
+        session: session.as_deref(),
+    };
+
+    match decide(policy, store, &req, &params, &identity).await {
+        Decision::Bypass => Flow::Continue(MissCtx::bypass(req.method)),
+        Decision::Cache { key, ttl } => {
+            if let Some(entry) = store.get(&key).await {
+                // HIT: re-stamp id and short-circuit.
+                if let Some(body) = restamp_id(&entry.body, &req.id) {
+                    let resp = Response::new(200)
+                        .with_headers(vec![
+                            ("content-type".to_string(), "application/json".to_string()),
+                            (HEADER.to_string(), "hit".to_string()),
+                        ])
+                        .with_body(body);
+                    return Flow::Break(resp);
+                }
+            }
+            // MISS: forward, remember where to store.
+            Flow::Continue(MissCtx {
+                disposition: Disposition::Miss,
+                key: Some(key),
+                ttl,
+                method: req.method,
+            })
+        }
+    }
 }
 
-/// Response filter. Fail-open scaffold: no-op until the store lifecycle lands.
-async fn response_filter(_response_state: ResponseState, _request_data: RequestData<()>) {}
+async fn response_filter<S: CacheStore>(
+    response_state: ResponseState,
+    request_data: RequestData<MissCtx>,
+    store: &S,
+) {
+    let ctx = match request_data {
+        RequestData::Continue(ctx) => ctx,
+        _ => return,
+    };
+
+    let headers_state = response_state.into_headers_state().await;
+    // Always surface the disposition to the client.
+    headers_state
+        .handler()
+        .set_header(HEADER, ctx.disposition.header_value());
+
+    // Only a genuine miss with a key does storage work.
+    let key = match (ctx.disposition, ctx.key.as_ref()) {
+        (Disposition::Miss, Some(k)) => k.clone(),
+        _ => return,
+    };
+
+    // Never buffer SSE.
+    if headers_state
+        .handler()
+        .header("content-type")
+        .map(|ct| ct.contains("text/event-stream"))
+        .unwrap_or(false)
+    {
+        return;
+    }
+
+    let body_state = headers_state.into_body_state().await;
+    let body = body_state.handler().body();
+
+    // Observe tools/list annotations regardless of whether we store the result.
+    if ctx.method == TOOLS_LIST {
+        crate::annotations::record_from_list(store, &body).await;
+    }
+
+    if is_cacheable_response(&body) {
+        let now = now_secs();
+        let entry = CachedEntry {
+            written_at: now,
+            valid_until: now + ctx.ttl,
+            body,
+        };
+        store.put(&key, &entry).await;
+    }
+}
+
+/// Launch the policy generically over the selected backend.
+async fn launch_policy<S: CacheStore + 'static>(
+    launcher: Launcher,
+    policy: Policy,
+    store: S,
+) -> Result<()> {
+    let policy = Rc::new(policy);
+    let store = Rc::new(store);
+
+    let req_policy = policy.clone();
+    let req_store = store.clone();
+    let resp_store = store.clone();
+
+    let filter = on_request(move |rs| {
+        let policy = req_policy.clone();
+        let store = req_store.clone();
+        async move { request_filter(rs, &policy, store.as_ref()).await }
+    })
+    .on_response(move |rs, req_data| {
+        let store = resp_store.clone();
+        async move { response_filter(rs, req_data, store.as_ref()).await }
+    });
+
+    launcher.launch(filter).await?;
+    Ok(())
+}
 
 #[entrypoint]
-async fn configure(launcher: Launcher, Configuration(bytes): Configuration) -> Result<()> {
+async fn configure(
+    launcher: Launcher,
+    Configuration(bytes): Configuration,
+    cache_builder: CacheBuilder,
+    store_builder: DataStorageBuilder,
+) -> Result<()> {
     let config: Config = serde_json::from_slice(&bytes).map_err(|err| {
         anyhow!(
             "Failed to parse configuration '{}'. Cause: {}",
@@ -65,14 +324,28 @@ async fn configure(launcher: Launcher, Configuration(bytes): Configuration) -> R
         config.discovery.ttl,
     );
 
-    let filter = on_request(move |rs| {
-        let config = config.clone();
-        async move { request_filter(rs, &config).await }
-    })
-    .on_response(|rs, req_data| async move { response_filter(rs, req_data).await });
+    let policy = Policy::new(&config);
 
-    launcher.launch(filter).await?;
-    Ok(())
+    if config.distributed {
+        // Namespace TTL bounds the whole cache; use the max configured ttl,
+        // with a floor so discovery-only configs still get a sane window.
+        let ttl_secs = config
+            .tools
+            .iter()
+            .map(|t| t.ttl)
+            .chain(std::iter::once(config.discovery.ttl))
+            .max()
+            .unwrap_or(60)
+            .max(60);
+        let storage = store_builder.remote(CACHE_ID, (ttl_secs as u32).saturating_mul(1000));
+        launch_policy(launcher, policy, GossipStore::new(storage)).await
+    } else {
+        let cache = cache_builder
+            .new(CACHE_ID.to_string())
+            .max_entries(config.max_entries as usize)
+            .build();
+        launch_policy(launcher, policy, LocalStore::new(cache)).await
+    }
 }
 
 #[cfg(test)]
