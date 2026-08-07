@@ -1,0 +1,46 @@
+# =============================================================================
+# MCP Tool-Call Response Cache — PDK / Omni Gateway custom policy (Rust + WASM)
+# =============================================================================
+
+# --- OS / editor cruft -------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+*~
+
+# --- IDE / tooling -----------------------------------------------------------
+.idea/
+.vscode/
+.cursor/
+*.iml
+
+# --- Rust / Cargo build artifacts -------------------------------------------
+**/target/
+**/*.rs.bk
+
+# --- Anypoint PDK build / runtime artifacts ---------------------------------
+.pdk/
+**/.pdk/
+**/playground/config/custom-policies/*
+!**/playground/config/custom-policies/note.txt
+
+# --- Anypoint Flex Gateway secrets (NEVER commit) ---------------------------
+**/registration.yaml
+**/certificate.yaml
+**/conf.d/registration.yaml
+**/conf.d/certificate.yaml
+
+# --- Generic secret / env files ---------------------------------------------
+.env
+.env.*
+!.env.example
+.envrc
+*.pem
+*.key
+*.p12
+*.pfx
+
+# --- Logs / temp -------------------------------------------------------------
+*.log

@@ -1,0 +1,45 @@
+# Copyright 2026 Salesforce, Inc. All rights reserved.
+---
+apiVersion: gateway.mulesoft.com/v1alpha1
+kind: ApiInstance
+metadata:
+  name: ingress-mcp
+spec:
+  address: http://0.0.0.0:8081
+  services:
+    upstream:
+      address: http://backend
+      routes:
+        - config:
+            destinationPath: /
+  policies:
+    - policyRef:
+        name: mcp-response-cache-policy-flex-v1-0 # Overridden during 'make run' execution
+        namespace: default
+      config:
+        # Cache discovery methods (tools/list, resources/list, prompts/list)
+        # for 60s — the highest-value entries agents re-issue on bootstrap.
+        discovery:
+          cacheable: true
+          ttl: 60
+        # Opt in per tool. A read-only lookup shared across all callers:
+        tools:
+          - name: search
+            cacheable: true
+            ttl: 120
+            scope: shared
+          # A per-caller result — keyed by principal + MCP session id:
+          - name: get_my_profile
+            cacheable: true
+            ttl: 30
+            scope: identity
+        # Local in-memory cache with hard LRU eviction at 1000 entries.
+        maxEntries: 1000
+        # Single-replica cache. Set true to share across replicas via gossip.
+        distributed: false
+        # Smoke testing tips (scaffold currently passes through — full cache
+        # lifecycle lands in the implementation phase):
+        # 1. POST a JSON-RPC body to http://localhost:8081/post
+        #    {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}
+        # 2. Repeated identical cacheable calls should return x-mcp-cache: hit.
+        # 3. Cache-Control: no-cache forces x-mcp-cache: bypass.

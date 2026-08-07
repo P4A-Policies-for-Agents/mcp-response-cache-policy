@@ -1,0 +1,37 @@
+# Copyright 2026 Salesforce, Inc. All rights reserved.
+
+# Standalone crate (not part of a Cargo workspace).
+# Dependencies are pinned directly.
+
+[package]
+name = "mcp_response_cache_policy"
+version = "1.0.0"
+rust-version = "1.88.0"
+edition = "2021"
+resolver = "2"
+description = "MCP Tool-Call Response Cache policy for MuleSoft Omni Gateway"
+
+[lib]
+crate-type = ["cdylib"]
+
+[package.metadata.anypoint]
+group_id = "00000000-0000-0000-0000-000000000000"
+definition_asset_id = { name = "mcp-response-cache", version = "1.0.0" }
+implementation_asset_id = "mcp-response-cache-policy-flex"
+
+[dependencies]
+pdk = { version = "1.9.2" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["alloc", "raw_value"] }
+anyhow = "1.0"
+mime = "0.3"
+sha2 = "0.10"
+hex = "0.4"
+
+[dev-dependencies]
+pdk-unit = { version = "1.9.2" }
+
+[profile.release]
+lto = true
+opt-level = 'z'
+strip = "debuginfo"
