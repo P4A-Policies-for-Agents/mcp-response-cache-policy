@@ -19,8 +19,8 @@ mod key;
 mod mcp;
 mod store;
 
-use crate::generated::config::{CacheScope, Config, ToolConfig};
-use crate::key::{cache_key, Identity};
+use crate::generated::config::Config;
+use crate::key::{cache_key, CacheScope, Identity};
 use crate::mcp::{
     is_cacheable_response, is_discovery_method, is_notification, parse_request, restamp_id,
     McpRequest, TOOLS_CALL, TOOLS_LIST,
@@ -37,6 +37,15 @@ use std::rc::Rc;
 const POLICY_NAME: &str = "mcp-response-cache-policy";
 const CACHE_ID: &str = "mcp-response-cache";
 const HEADER: &str = "x-mcp-cache";
+
+// Defaults mirror definition/gcl.yaml. The generated Config wraps optional
+// fields in Option (config-gen drops gcl `default:` clauses), so the policy
+// re-applies them here at load time.
+const DEFAULT_DISCOVERY_CACHEABLE: bool = true;
+const DEFAULT_DISCOVERY_TTL: u64 = 60;
+const DEFAULT_MAX_ENTRIES: u32 = 1000;
+const DEFAULT_DISTRIBUTED: bool = false;
+const DEFAULT_TOOL_CACHEABLE: bool = false;
 
 /// Disposition threaded to the response filter and used to stamp `x-mcp-cache`.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -76,6 +85,15 @@ impl MissCtx {
     }
 }
 
+/// A tool's cache settings, resolved from the generated (Option-wrapped)
+/// config into concrete domain values.
+#[derive(Clone)]
+struct ToolConfig {
+    cacheable: bool,
+    ttl: u64,
+    scope: CacheScope,
+}
+
 /// Immutable per-worker view of config, precomputed for O(1) tool lookup.
 struct Policy {
     discovery_cacheable: bool,
@@ -85,15 +103,35 @@ struct Policy {
 
 impl Policy {
     fn new(config: &Config) -> Self {
+        let discovery_cacheable = config
+            .discovery
+            .cacheable
+            .unwrap_or(DEFAULT_DISCOVERY_CACHEABLE);
+        let discovery_ttl = config
+            .discovery
+            .ttl
+            .map(|t| t.max(0) as u64)
+            .unwrap_or(DEFAULT_DISCOVERY_TTL);
+
         let tools = config
             .tools
+            .as_deref()
+            .unwrap_or(&[])
             .iter()
-            .cloned()
-            .map(|t| (t.name.clone(), t))
+            .map(|t| {
+                let resolved = ToolConfig {
+                    cacheable: t.cacheable.unwrap_or(DEFAULT_TOOL_CACHEABLE),
+                    // gcl requires ttl >= 1; clamp defensively.
+                    ttl: t.ttl.max(1) as u64,
+                    scope: CacheScope::parse(t.scope.as_deref()),
+                };
+                (t.name.clone(), resolved)
+            })
             .collect();
+
         Self {
-            discovery_cacheable: config.discovery.cacheable && config.discovery.ttl > 0,
-            discovery_ttl: config.discovery.ttl,
+            discovery_cacheable: discovery_cacheable && discovery_ttl > 0,
+            discovery_ttl,
             tools,
         }
     }
@@ -314,26 +352,31 @@ async fn configure(
         )
     })?;
 
+    let policy = Policy::new(&config);
+    let distributed = config.distributed.unwrap_or(DEFAULT_DISTRIBUTED);
+    let max_entries = config
+        .max_entries
+        .map(|m| m.max(1) as u32)
+        .unwrap_or(DEFAULT_MAX_ENTRIES);
+
     logger::info!(
         "[{}] configured (distributed={}, max_entries={}, tools={}, discovery.cacheable={}, discovery.ttl={}s)",
         POLICY_NAME,
-        config.distributed,
-        config.max_entries,
-        config.tools.len(),
-        config.discovery.cacheable,
-        config.discovery.ttl,
+        distributed,
+        max_entries,
+        policy.tools.len(),
+        policy.discovery_cacheable,
+        policy.discovery_ttl,
     );
 
-    let policy = Policy::new(&config);
-
-    if config.distributed {
+    if distributed {
         // Namespace TTL bounds the whole cache; use the max configured ttl,
         // with a floor so discovery-only configs still get a sane window.
-        let ttl_secs = config
+        let ttl_secs = policy
             .tools
-            .iter()
+            .values()
             .map(|t| t.ttl)
-            .chain(std::iter::once(config.discovery.ttl))
+            .chain(std::iter::once(policy.discovery_ttl))
             .max()
             .unwrap_or(60)
             .max(60);
@@ -342,7 +385,7 @@ async fn configure(
     } else {
         let cache = cache_builder
             .new(CACHE_ID.to_string())
-            .max_entries(config.max_entries as usize)
+            .max_entries(max_entries as usize)
             .build();
         launch_policy(launcher, policy, LocalStore::new(cache)).await
     }

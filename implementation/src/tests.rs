@@ -4,25 +4,28 @@
 // live in `mcp.rs`. Cache-lifecycle tests are added with the lifecycle in the
 // implementation phase.
 
-use crate::generated::config::{CacheScope, Config};
+use crate::generated::config::Config;
+use crate::Policy;
 
-fn parse(json: &str) -> Config {
-    serde_json::from_str(json).expect("config must parse")
+/// Parse a gcl config JSON (the generated, Option-wrapped shape) and resolve it
+/// through `Policy::new`, which re-applies the gcl `default:` clauses that
+/// `cargo anypoint config-gen` strips.
+fn policy(json: &str) -> Policy {
+    let cfg: Config = serde_json::from_str(json).expect("config must parse");
+    Policy::new(&cfg)
 }
 
 #[test]
 fn parses_minimal_config_with_defaults() {
-    let cfg = parse(r#"{"discovery":{}}"#);
-    assert!(cfg.discovery.cacheable);
-    assert_eq!(cfg.discovery.ttl, 60);
-    assert_eq!(cfg.max_entries, 1000);
-    assert!(!cfg.distributed);
-    assert!(cfg.tools.is_empty());
+    let p = policy(r#"{"discovery":{}}"#);
+    assert!(p.discovery_cacheable);
+    assert_eq!(p.discovery_ttl, 60);
+    assert!(p.tools.is_empty());
 }
 
 #[test]
 fn parses_full_config() {
-    let cfg = parse(
+    let p = policy(
         r#"{
             "discovery": {"cacheable": false, "ttl": 30},
             "tools": [{"name": "search", "cacheable": true, "ttl": 120, "scope": "identity"}],
@@ -30,27 +33,34 @@ fn parses_full_config() {
             "distributed": true
         }"#,
     );
-    assert!(!cfg.discovery.cacheable);
-    assert_eq!(cfg.discovery.ttl, 30);
-    assert_eq!(cfg.max_entries, 500);
-    assert!(cfg.distributed);
-    assert_eq!(cfg.tools.len(), 1);
-    assert_eq!(cfg.tools[0].name, "search");
-    assert!(cfg.tools[0].cacheable);
-    assert_eq!(cfg.tools[0].ttl, 120);
-    assert_eq!(cfg.tools[0].scope, CacheScope::Identity);
+    // discovery.cacheable=false collapses discovery_cacheable to false.
+    assert!(!p.discovery_cacheable);
+    assert_eq!(p.discovery_ttl, 30);
+    assert_eq!(p.tools.len(), 1);
+    let search = p.tools.get("search").expect("search tool resolved");
+    assert!(search.cacheable);
+    assert_eq!(search.ttl, 120);
+    assert_eq!(search.scope, CacheScope::Identity);
 }
 
 #[test]
 fn tool_scope_defaults_to_shared() {
-    let cfg = parse(r#"{"discovery":{},"tools":[{"name":"t","ttl":10}]}"#);
-    assert_eq!(cfg.tools[0].scope, CacheScope::Shared);
-    assert!(!cfg.tools[0].cacheable);
+    let p = policy(r#"{"discovery":{},"tools":[{"name":"t","ttl":10}]}"#);
+    let t = p.tools.get("t").expect("tool resolved");
+    assert_eq!(t.scope, CacheScope::Shared);
+    assert!(!t.cacheable);
+}
+
+#[test]
+fn discovery_ttl_zero_disables_discovery() {
+    // ttl=0 forces discovery_cacheable false even when cacheable=true.
+    let p = policy(r#"{"discovery":{"cacheable":true,"ttl":0}}"#);
+    assert!(!p.discovery_cacheable);
 }
 
 // --- key.rs -----------------------------------------------------------------
 
-use crate::key::{cache_key, canonicalize, Identity};
+use crate::key::{cache_key, canonicalize, CacheScope, Identity};
 use serde_json::json;
 
 #[test]

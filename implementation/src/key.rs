@@ -4,12 +4,35 @@
 // SHA-256 the (method, params) tuple, and assemble a scope-aware key. Sensitive
 // identity values participate only as hashes, never raw.
 
-use crate::generated::config::CacheScope;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 /// Record separator between method and params inside the hash preimage.
 const RS: u8 = 0x1e;
+
+/// Cache partitioning for a tool. Defined here (not in `generated::config`)
+/// because `cargo anypoint config-gen` emits the `scope` property as a plain
+/// `Option<String>`, not an enum — the P4A build pipeline regenerates that file
+/// at deploy time, so domain types must live outside it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum CacheScope {
+    /// Key on tool + canonical args only; one entry shared across all callers.
+    #[default]
+    Shared,
+    /// Also partition by authenticated principal and MCP session id.
+    Identity,
+}
+
+impl CacheScope {
+    /// Parse the gcl `scope` string. Anything other than `"identity"`
+    /// (including absence) is the safe default, `Shared`.
+    pub fn parse(scope: Option<&str>) -> Self {
+        match scope {
+            Some("identity") => CacheScope::Identity,
+            _ => CacheScope::Shared,
+        }
+    }
+}
 
 /// Caller identity for `identity`-scoped keys. Both fields optional; the key
 /// degrades to whichever is present.

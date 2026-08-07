@@ -6,9 +6,6 @@
 // carries no method name, so a response-side cache must thread the method from
 // the request side. This module owns the protocol facts; the cache lifecycle
 // (key construction, lookup/store, guardrails) builds on top of it.
-//
-// Scaffold: the parser + vocabulary are defined ahead of the cache lifecycle
-// that consumes them (implementation phase). Tests exercise them today.
 #![allow(dead_code)]
 
 use serde_json::Value;
