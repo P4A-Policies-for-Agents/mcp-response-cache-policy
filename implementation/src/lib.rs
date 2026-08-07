@@ -15,6 +15,7 @@
 mod generated;
 mod key;
 mod mcp;
+mod store;
 
 use crate::generated::config::Config;
 use anyhow::{anyhow, Result};

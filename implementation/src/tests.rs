@@ -96,3 +96,58 @@ fn identity_key_present_with_only_session() {
     let id = Identity { principal: None, session: Some("s1") };
     assert!(cache_key("tools/call", &json!({}), CacheScope::Identity, &id).is_some());
 }
+
+// --- store.rs ---------------------------------------------------------------
+
+use crate::store::{now_secs, CacheStore, CachedEntry, LocalStore};
+use pdk::cache::{Cache, CacheError};
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+pub(crate) struct MockCache {
+    data: Mutex<HashMap<String, Vec<u8>>>,
+}
+impl MockCache {
+    pub(crate) fn new() -> Self {
+        Self { data: Mutex::new(HashMap::new()) }
+    }
+}
+impl Cache for MockCache {
+    fn save(&self, key: &str, value: Vec<u8>) -> Result<(), CacheError> {
+        self.data.lock().unwrap().insert(key.to_string(), value);
+        Ok(())
+    }
+    fn get(&self, key: &str) -> Option<Vec<u8>> {
+        self.data.lock().unwrap().get(key).cloned()
+    }
+    fn delete(&self, key: &str) -> Option<Vec<u8>> {
+        self.data.lock().unwrap().remove(key)
+    }
+    fn purge(&self) {
+        self.data.lock().unwrap().clear();
+    }
+}
+
+#[test]
+fn cached_entry_freshness() {
+    let now = 1000;
+    let fresh = CachedEntry { written_at: now, valid_until: now + 10, body: vec![1] };
+    let stale = CachedEntry { written_at: now, valid_until: now, body: vec![1] };
+    assert!(fresh.is_fresh(now + 5));
+    assert!(!stale.is_fresh(now + 1));
+}
+
+#[tokio::test]
+async fn local_store_roundtrip_and_expiry() {
+    let store = LocalStore::new(MockCache::new());
+    let now = now_secs();
+    let entry = CachedEntry { written_at: now, valid_until: now + 60, body: b"hi".to_vec() };
+    store.put("k", &entry).await;
+    let got = store.get("k").await.expect("hit");
+    assert_eq!(got.body, b"hi");
+
+    // Stale entry is evicted on read (local mode).
+    let stale = CachedEntry { written_at: now - 100, valid_until: now - 1, body: b"x".to_vec() };
+    store.put("s", &stale).await;
+    assert!(store.get("s").await.is_none());
+}
