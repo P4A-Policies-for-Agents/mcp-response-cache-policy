@@ -12,6 +12,7 @@
 // CacheStore backends are implemented in the follow-up implementation phase —
 // see docs/architecture.md and the modules below.
 
+mod annotations;
 mod generated;
 mod key;
 mod mcp;

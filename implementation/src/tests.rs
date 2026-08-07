@@ -151,3 +151,20 @@ async fn local_store_roundtrip_and_expiry() {
     store.put("s", &stale).await;
     assert!(store.get("s").await.is_none());
 }
+
+// --- annotations.rs ---------------------------------------------------------
+
+use crate::annotations::{is_known_unsafe, record_from_list};
+
+#[tokio::test]
+async fn records_and_reads_unsafe_tools() {
+    let store = LocalStore::new(MockCache::new());
+    let list = br#"{"jsonrpc":"2.0","id":1,"result":{"tools":[
+        {"name":"safe","annotations":{"readOnlyHint":true}},
+        {"name":"writer","annotations":{"destructiveHint":true}}
+    ]}}"#;
+    record_from_list(&store, list).await;
+    assert!(is_known_unsafe(&store, "writer").await);
+    assert!(!is_known_unsafe(&store, "safe").await);
+    assert!(!is_known_unsafe(&store, "never-seen").await);
+}
