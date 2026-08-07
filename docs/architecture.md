@@ -107,11 +107,11 @@ mcp-response-cache-policy/
 │   ├── tests/            # integration tests (pdk-test)
 │   └── src/
 │       ├── lib.rs        # entrypoint + request/response filters
-│       ├── mcp.rs        # JSON-RPC envelope parse + MCP method vocabulary
+│       ├── mcp.rs        # JSON-RPC parse (request + response) + method
+│       │                 #   vocabulary + hit-response envelope builder
 │       ├── key.rs        # canonicalize params + SHA-256 keying + scope
 │       ├── store.rs      # CacheStore trait + LocalStore + GossipStore
 │       ├── annotations.rs# observed tool annotations (defense-in-depth, §5)
-│       ├── errors.rs     # JSON-RPC error envelope helpers
 │       └── generated/    # config.rs (from gcl.yaml — do not hand-edit)
 └── docs/
 ```
