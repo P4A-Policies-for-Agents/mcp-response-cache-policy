@@ -1,4 +1,4 @@
-# MCP Tool-Call Response Cache
+# MCP Response Cache
 
 A MuleSoft Omni Gateway custom policy (PDK) that **caches side-effect-free MCP
 responses at the gateway** so repeated, read-only tool calls and discovery

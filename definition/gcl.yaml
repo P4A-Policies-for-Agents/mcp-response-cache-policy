@@ -3,7 +3,7 @@ apiVersion: gateway.mulesoft.com/v1alpha1
 kind: Extension
 metadata:
   labels:
-    title: MCP Tool-Call Response Cache
+    title: MCP Response Cache
     description: >-
       Caches side-effect-free MCP responses (tools/list, resources/list,
       prompts/list, and allowlisted read-only tools/call) at the gateway so

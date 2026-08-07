@@ -9,7 +9,7 @@ version = "1.0.0"
 rust-version = "1.88.0"
 edition = "2021"
 resolver = "2"
-description = "MCP Tool-Call Response Cache policy for MuleSoft Omni Gateway"
+description = "MCP Response Cache policy for MuleSoft Omni Gateway"
 
 [lib]
 crate-type = ["cdylib"]

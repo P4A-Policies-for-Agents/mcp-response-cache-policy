@@ -1,6 +1,6 @@
 // Copyright 2026 Salesforce, Inc. All rights reserved.
 //
-// MCP Tool-Call Response Cache — MuleSoft Omni Gateway custom policy (PDK).
+// MCP Response Cache — MuleSoft Omni Gateway custom policy (PDK).
 //
 // Caches side-effect-free MCP responses (discovery methods and allowlisted
 // read-only tools/call) at the gateway so repeated agent calls are served

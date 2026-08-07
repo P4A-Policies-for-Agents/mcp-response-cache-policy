@@ -1,4 +1,8 @@
-# MCP Tool-Call Response Cache — Architecture
+# MCP Response Cache — Architecture
+
+> Delivers the P4A idea "MCP Tool-Call Response Cache"
+> (`8ce9e2c4-03e2-44cf-96b1-9cca946e0a60`); shipped under the display name
+> **MCP Response Cache**.
 
 - **Target PDK:** 1.9.2 (common floor on crates.io `cargo-anypoint` and PDK release notes)
 - **Category:** MCP · `assetTypes: mcp` · `interfaceScope: api`

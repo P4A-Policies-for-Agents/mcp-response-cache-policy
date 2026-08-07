@@ -1,4 +1,4 @@
-# MCP Tool-Call Response Cache — Playground
+# MCP Response Cache — Playground
 
 Local smoke-test environment for the `mcp-response-cache-policy`.
 
