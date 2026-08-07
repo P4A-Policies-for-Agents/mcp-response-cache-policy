@@ -13,6 +13,7 @@
 // see docs/architecture.md and the modules below.
 
 mod generated;
+mod key;
 mod mcp;
 
 use crate::generated::config::Config;
