@@ -54,6 +54,7 @@ async fn setup_test() -> anyhow::Result<&'static TestSetup> {
             "discovery": { "cacheable": true, "ttl": 60 },
             "tools": [
                 { "name": "read_only_search", "cacheable": true, "ttl": 60, "scope": "shared" },
+                { "name": "stream_search", "cacheable": true, "ttl": 60, "scope": "shared" },
                 { "name": "whoami", "cacheable": true, "ttl": 60, "scope": "identity" }
             ],
             "maxEntries": 1000,
@@ -165,6 +166,101 @@ async fn discovery_miss_then_hit() -> anyhow::Result<()> {
     assert_eq!(body["id"], json!(2), "cached body id re-stamped to live request id");
     assert_eq!(body["result"]["tools"][0]["name"], json!("read_only_search"));
 
+    Ok(())
+}
+
+#[pdk_test]
+async fn sse_framed_discovery_miss_then_hit() -> anyhow::Result<()> {
+    let setup = setup_test().await?;
+
+    // Real streamable-HTTP MCP servers frame a single-shot result as SSE
+    // (Content-Type: text/event-stream, one `event: message` + one `data:`
+    // line) rather than bare application/json. The cache must unwrap that
+    // single event, store it, and serve the second identical call from cache.
+    // Scope by a distinct method so it doesn't collide with the JSON-bodied
+    // tools/list mock in `discovery_miss_then_hit`.
+    let upstream = setup
+        .mock_server
+        .mock_async(|when, then| {
+            when.method("POST").path("/").body_contains("\"method\":\"resources/list\"");
+            then.status(200)
+                .header("Content-Type", "text/event-stream")
+                .body(
+                    "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resources\":[{\"uri\":\"file:///a\"}]}}\n\n",
+                );
+        })
+        .await;
+
+    let client = reqwest::Client::new();
+
+    // First request: MISS — forwarded upstream, SSE body unwrapped and stored.
+    let first = client
+        .post(&setup.api_url)
+        .header("Content-Type", "application/json")
+        .body(rpc_request(1, "resources/list", json!({})))
+        .send()
+        .await?;
+    assert_eq!(first.status(), 200);
+    assert_eq!(cache_header(&first).as_deref(), Some("miss"));
+    upstream.assert_hits_async(1).await;
+
+    // Second identical request, different id: HIT — served from cache as a
+    // clean JSON-RPC object with the id re-stamped, upstream not re-hit.
+    let second = client
+        .post(&setup.api_url)
+        .header("Content-Type", "application/json")
+        .body(rpc_request(2, "resources/list", json!({})))
+        .send()
+        .await?;
+    assert_eq!(second.status(), 200);
+    assert_eq!(cache_header(&second).as_deref(), Some("hit"));
+    upstream.assert_hits_async(1).await;
+
+    let body: serde_json::Value = second.json().await?;
+    assert_eq!(body["id"], json!(2), "cached SSE payload re-stamped to live id");
+    assert_eq!(body["result"]["resources"][0]["uri"], json!("file:///a"));
+
+    Ok(())
+}
+
+#[pdk_test]
+async fn multi_event_sse_stream_not_cached() -> anyhow::Result<()> {
+    let setup = setup_test().await?;
+
+    // A genuine multi-event stream (progress notification + terminal result)
+    // must never be collapsed into a single cached entry. Both identical calls
+    // stay a miss and reach upstream. Scope by a dedicated allowlisted tool
+    // (`stream_search`) so this mock is mutually exclusive from every other
+    // test sharing this composite — matching on method + tool name.
+    let upstream = setup
+        .mock_server
+        .mock_async(|when, then| {
+            when.method("POST")
+                .path("/")
+                .body_contains("\"method\":\"tools/call\"")
+                .body_contains("\"name\":\"stream_search\"");
+            then.status(200)
+                .header("Content-Type", "text/event-stream")
+                .body(
+                    "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progress\":0.5}}\n\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"done\"}]}}\n\n",
+                );
+        })
+        .await;
+
+    let client = reqwest::Client::new();
+    let params = json!({ "name": "stream_search", "arguments": { "q": "hello" } });
+    for id in 30..=31 {
+        let resp = client
+            .post(&setup.api_url)
+            .header("Content-Type", "application/json")
+            .body(rpc_request(id, "tools/call", params.clone()))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(cache_header(&resp).as_deref(), Some("miss"));
+    }
+    // Never cached → both requests reach upstream.
+    upstream.assert_hits_async(2).await;
     Ok(())
 }
 

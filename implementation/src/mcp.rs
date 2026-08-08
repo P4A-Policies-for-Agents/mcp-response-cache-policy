@@ -86,6 +86,77 @@ pub fn parse_request(body: &[u8]) -> Option<McpRequest> {
 
 // --- Response side ----------------------------------------------------------
 
+/// Extract the single JSON-RPC payload from a streamable-HTTP MCP response body.
+///
+/// MCP's streamable-HTTP transport frames even a non-streaming, single-shot
+/// result as Server-Sent Events: one `event: message` block whose `data:` line
+/// carries the JSON-RPC object. This normalizes such a body to the raw JSON
+/// bytes so the rest of the response path (cacheability check, storage) can
+/// treat SSE-framed and bare-JSON responses uniformly.
+///
+/// Returns `Some(json_bytes)` only when the body contains **exactly one**
+/// `data:` payload that parses as a JSON object — i.e. a single-shot result.
+/// A body with multiple `data:` events is a genuine multi-event stream (progress
+/// notifications, chunked/streamed output) and is intentionally rejected
+/// (`None`): those must never be collapsed into one cached entry. A bare-JSON
+/// body (no SSE framing) is returned as-is when it parses as a JSON object.
+///
+/// Per the SSE spec, a `data:` value may span multiple consecutive `data:`
+/// lines within one event (joined with `\n`); this handles that. Comment lines
+/// (`:`), the `event:`/`id:`/`retry:` fields, and blank separators are ignored.
+pub fn extract_single_json(body: &[u8]) -> Option<Vec<u8>> {
+    let text = std::str::from_utf8(body).ok()?;
+
+    // Bare JSON (not SSE-framed): accept iff it is a JSON object.
+    let looks_like_sse = text
+        .lines()
+        .any(|l| l.starts_with("data:") || l.starts_with("event:"));
+    if !looks_like_sse {
+        return serde_json::from_slice::<Value>(body)
+            .ok()
+            .filter(Value::is_object)
+            .map(|_| body.to_vec());
+    }
+
+    // SSE-framed: collect the payload of each event. An event ends at a blank
+    // line; its data is the concatenation (by `\n`) of its `data:` lines.
+    let mut events: Vec<String> = Vec::new();
+    let mut current: Option<String> = None;
+    for line in text.lines() {
+        if line.is_empty() {
+            if let Some(data) = current.take() {
+                events.push(data);
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("data:") {
+            // A single leading space after the colon is part of the framing.
+            let rest = rest.strip_prefix(' ').unwrap_or(rest);
+            match current.as_mut() {
+                Some(buf) => {
+                    buf.push('\n');
+                    buf.push_str(rest);
+                }
+                None => current = Some(rest.to_string()),
+            }
+        }
+        // event:/id:/retry:/comment lines carry no payload — ignore.
+    }
+    if let Some(data) = current.take() {
+        events.push(data);
+    }
+
+    // Exactly one single-shot event, and it must be a JSON object.
+    if events.len() != 1 {
+        return None;
+    }
+    let payload = events.into_iter().next()?;
+    serde_json::from_str::<Value>(&payload)
+        .ok()
+        .filter(Value::is_object)
+        .map(|_| payload.into_bytes())
+}
+
 /// True iff the response is a cacheable JSON-RPC success: parses as an object,
 /// carries a `result`, has no `error`, and is not a tool-level error
 /// (`result.isError == true`).
@@ -201,6 +272,55 @@ mod tests {
     fn cacheable_response_accepts_result() {
         let ok = br#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#;
         assert!(is_cacheable_response(ok));
+    }
+
+    #[test]
+    fn extract_single_json_from_sse_event() {
+        // The exact shape a streamable-HTTP MCP server returns for a single-shot
+        // result: one `event: message` block, one `data:` line.
+        let body = b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"ok\":true}}\n\n";
+        let json = extract_single_json(body).expect("single event must extract");
+        let v: Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(v["id"], serde_json::json!(3));
+        assert_eq!(v["result"]["ok"], serde_json::json!(true));
+        // And the extracted JSON flows through the cacheability gate.
+        assert!(is_cacheable_response(&json));
+    }
+
+    #[test]
+    fn extract_single_json_passes_bare_json_through() {
+        let body = br#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#;
+        let json = extract_single_json(body).expect("bare json object passes through");
+        assert_eq!(json, body.to_vec());
+    }
+
+    #[test]
+    fn extract_single_json_joins_multiline_data() {
+        // Per the SSE spec a single event's data can span consecutive data:
+        // lines, joined by \n. This is still ONE event → one JSON payload.
+        let body = b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\ndata: \"result\":{\"v\":2}}\n\n";
+        let json = extract_single_json(body).expect("multiline single event extracts");
+        let v: Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(v["result"]["v"], serde_json::json!(2));
+    }
+
+    #[test]
+    fn extract_single_json_rejects_multi_event_stream() {
+        // Progress notification + terminal result = a genuine multi-event stream.
+        // Never collapse it into one cached entry.
+        let body = b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progress\":0.5}}\n\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n";
+        assert!(extract_single_json(body).is_none());
+    }
+
+    #[test]
+    fn extract_single_json_rejects_non_object_payload() {
+        // A data: line that isn't a JSON object (array / scalar / garbage).
+        let arr = b"event: message\ndata: [1,2,3]\n\n";
+        let scalar = b"event: message\ndata: 42\n\n";
+        let garbage = b"event: message\ndata: not json\n\n";
+        assert!(extract_single_json(arr).is_none());
+        assert!(extract_single_json(scalar).is_none());
+        assert!(extract_single_json(garbage).is_none());
     }
 
     #[test]

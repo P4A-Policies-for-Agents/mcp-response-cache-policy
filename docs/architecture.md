@@ -150,13 +150,29 @@ cache.get(key):
 
 ```
 only on Flow::Continue(Ctx):
-  skip if Content-Type is text/event-stream (SSE — single-shot JSON only)
+  normalize transport framing (extract_single_json):
+    • bare application/json object            → use as-is
+    • single-event SSE frame (text/event-stream, one `event`/`data:` block,
+      data is one JSON object)                → unwrap to that JSON
+    • multi-event SSE stream (>1 data event)  → skip (never collapse a stream)
+    • data payload not a JSON object          → skip
   parse JSON-RPC response:
     skip if resp.error is present            (never cache error envelopes)
     skip if result missing                   (nothing to store)
     skip if result.isError == true           (tool-level error)
-  else cache.put(key, CachedEntry { status, headers, body, written_at }, ttl)
+  else cache.put(key, CachedEntry { written_at, valid_until, body }, ttl)
 ```
+
+**Why unwrap SSE rather than skip it.** MCP's streamable-HTTP transport frames
+*every* response as Server-Sent Events — including the single-shot results of
+the cacheable methods (`*/list`, read-only `tools/call`), which come back as one
+`event: message` + one `data:` JSON-RPC line with `Content-Type:
+text/event-stream`. Skipping all `text/event-stream` would mean the cache never
+populates against a real MCP server (only against a backend that happens to
+answer bare `application/json`). So the response filter unwraps the single JSON
+payload from a one-event frame and stores that; on a hit the request filter
+serves it back as `application/json` (a clean single JSON-RPC object every MCP
+client accepts). Genuine multi-event streams are still never cached.
 
 ### Key construction
 
@@ -175,7 +191,8 @@ scope == identity  → key = "{method}:{base}:{sha256(principal)}:{sha256(sessio
 ### Never cached (guardrails, all fail-open)
 
 - JSON-RPC error envelopes and results flagged `isError`.
-- Streaming / SSE responses (`text/event-stream`) — single-shot JSON only.
+- Multi-event SSE streams (progress notifications, chunked/streamed output) —
+  only a single-shot result (one SSE `data:` event, or bare JSON) is cached.
 - Non-allowlisted tools (default `cacheable:false` ⇒ pass-through).
 - Side-effecting tools — honors observed MCP annotations (`destructiveHint`,
   absence of `readOnlyHint`); never cached even if allowlisted (§5).
@@ -268,7 +285,14 @@ at `configure()` for O(1) lookup).
 ## 9. Non-Goals (v1)
 
 - ETag/`304` revalidation (no MCP validator concept).
-- Caching SSE/streaming responses.
+- Caching **multi-event** SSE streams. Single-event SSE frames — how
+  streamable-HTTP servers deliver the single-shot results of the cacheable
+  methods — *are* cached (§4). A genuine multi-event stream is a progress
+  notification sequence plus a terminal `result`; extracting and caching only
+  that terminal envelope (dropping the request-bound progress frames) is a
+  plausible follow-up, but distinguishing "completed op that emitted progress"
+  (safe) from "streamed partial content the client reassembles" (unsafe to
+  collapse) needs its own design and tests, so it is deferred.
 - JSON-RPC batch (array) bodies.
 - Publishing/release — handled separately via the P4A MCP server
   (`submit_policy`/`deploy_policy`), gated for human approval.
