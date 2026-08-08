@@ -281,18 +281,18 @@ async fn response_filter<S: CacheStore>(
         _ => return,
     };
 
-    // Never buffer SSE.
-    if headers_state
-        .handler()
-        .header("content-type")
-        .map(|ct| ct.contains("text/event-stream"))
-        .unwrap_or(false)
-    {
-        return;
-    }
-
     let body_state = headers_state.into_body_state().await;
-    let body = body_state.handler().body();
+    let raw = body_state.handler().body();
+
+    // Normalize the transport framing. Streamable-HTTP MCP servers wrap a
+    // single-shot JSON-RPC result in a one-event SSE frame; unwrap it to the
+    // raw JSON so it can be cached and replayed as application/json on a hit.
+    // A multi-event stream (progress/streamed output) yields None and is never
+    // cached. A bare-JSON response passes through unchanged.
+    let body = match crate::mcp::extract_single_json(&raw) {
+        Some(json) => json,
+        None => return,
+    };
 
     // Observe tools/list annotations regardless of whether we store the result.
     if ctx.method == TOOLS_LIST {
