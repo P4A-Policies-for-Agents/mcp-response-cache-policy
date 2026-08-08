@@ -284,12 +284,14 @@ async fn response_filter<S: CacheStore>(
     let body_state = headers_state.into_body_state().await;
     let raw = body_state.handler().body();
 
-    // Normalize the transport framing. Streamable-HTTP MCP servers wrap a
-    // single-shot JSON-RPC result in a one-event SSE frame; unwrap it to the
-    // raw JSON so it can be cached and replayed as application/json on a hit.
-    // A multi-event stream (progress/streamed output) yields None and is never
-    // cached. A bare-JSON response passes through unchanged.
-    let body = match crate::mcp::extract_single_json(&raw) {
+    // Normalize the transport framing. Streamable-HTTP MCP servers frame the
+    // JSON-RPC result as SSE; extract the terminal success response to the raw
+    // JSON so it can be cached and replayed as application/json on a hit. This
+    // handles a bare-JSON body, a single-event frame, and a multi-event
+    // "progress notifications + one terminal result" stream (the notifications
+    // are dropped). An unsafe stream (server→client request, error, ambiguous)
+    // yields None and is never cached.
+    let body = match crate::mcp::extract_cacheable_json(&raw) {
         Some(json) => json,
         None => return,
     };

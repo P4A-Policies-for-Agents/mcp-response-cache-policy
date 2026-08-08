@@ -150,11 +150,16 @@ cache.get(key):
 
 ```
 only on Flow::Continue(Ctx):
-  normalize transport framing (extract_single_json):
+  normalize transport framing (extract_cacheable_json):
     • bare application/json object            → use as-is
     • single-event SSE frame (text/event-stream, one `event`/`data:` block,
       data is one JSON object)                → unwrap to that JSON
-    • multi-event SSE stream (>1 data event)  → skip (never collapse a stream)
+    • multi-event SSE stream, reduced by classifying each event:
+        notification (method, NO id)          → drop (fire-and-forget)
+        terminal success (id + result)        → the payload to store
+        server→client request (method + id)   → UNSAFE ⇒ skip whole stream
+        terminal error / 2nd terminal / other → UNSAFE ⇒ skip whole stream
+      cache iff the stream is (notification)* + exactly one terminal success
     • data payload not a JSON object          → skip
   parse JSON-RPC response:
     skip if resp.error is present            (never cache error envelopes)
@@ -169,10 +174,22 @@ the cacheable methods (`*/list`, read-only `tools/call`), which come back as one
 `event: message` + one `data:` JSON-RPC line with `Content-Type:
 text/event-stream`. Skipping all `text/event-stream` would mean the cache never
 populates against a real MCP server (only against a backend that happens to
-answer bare `application/json`). So the response filter unwraps the single JSON
-payload from a one-event frame and stores that; on a hit the request filter
+answer bare `application/json`). So the response filter unwraps the JSON payload
+of the terminal success response and stores that; on a hit the request filter
 serves it back as `application/json` (a clean single JSON-RPC object every MCP
-client accepts). Genuine multi-event streams are still never cached.
+client accepts).
+
+**Multi-event streams — the safe collapse.** A stream carrying progress
+notifications followed by the terminal result is a "completed operation that
+emitted progress": the notifications are fire-and-forget (`method`, no `id`) and
+a client that re-requests the same call never needed them, so the cache stores
+only the terminal result and drops the rest. The distinguishing safety
+invariant is JSON-RPC shape, not heuristics: an event with a `method` **and** an
+`id` is a *server→client request* (sampling / elicitation / roots) that requires
+a client round-trip — a stream containing one is interactive, not a completed
+op, and is never cached. Likewise a terminal error, a second terminal response,
+or a notifications-only stream aborts the collapse (`None`). The gate is exactly
+`(notification)* + one terminal success`.
 
 ### Key construction
 
@@ -191,8 +208,11 @@ scope == identity  → key = "{method}:{base}:{sha256(principal)}:{sha256(sessio
 ### Never cached (guardrails, all fail-open)
 
 - JSON-RPC error envelopes and results flagged `isError`.
-- Multi-event SSE streams (progress notifications, chunked/streamed output) —
-  only a single-shot result (one SSE `data:` event, or bare JSON) is cached.
+- Interactive SSE streams — any stream carrying a server→client request
+  (`method` + `id`: sampling / elicitation / roots), a terminal error, or more
+  than one terminal response. A progress-then-result stream *is* cached (only
+  its terminal success is stored); a bare/single-event result is cached as
+  before.
 - Non-allowlisted tools (default `cacheable:false` ⇒ pass-through).
 - Side-effecting tools — honors observed MCP annotations (`destructiveHint`,
   absence of `readOnlyHint`); never cached even if allowlisted (§5).
@@ -285,14 +305,12 @@ at `configure()` for O(1) lookup).
 ## 9. Non-Goals (v1)
 
 - ETag/`304` revalidation (no MCP validator concept).
-- Caching **multi-event** SSE streams. Single-event SSE frames — how
-  streamable-HTTP servers deliver the single-shot results of the cacheable
-  methods — *are* cached (§4). A genuine multi-event stream is a progress
-  notification sequence plus a terminal `result`; extracting and caching only
-  that terminal envelope (dropping the request-bound progress frames) is a
-  plausible follow-up, but distinguishing "completed op that emitted progress"
-  (safe) from "streamed partial content the client reassembles" (unsafe to
-  collapse) needs its own design and tests, so it is deferred.
+- Caching **interactive** SSE streams — any stream whose events include a
+  server→client request (`method` + `id`). Progress-then-result streams (the
+  "completed op that emitted progress" case) *are* cached by storing only the
+  terminal success and dropping the fire-and-forget notifications (§4); the
+  interactive case is out because collapsing it would skip a required client
+  round-trip.
 - JSON-RPC batch (array) bodies.
 - Publishing/release — handled separately via the P4A MCP server
   (`submit_policy`/`deploy_policy`), gated for human approval.
