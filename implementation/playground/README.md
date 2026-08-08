@@ -21,7 +21,8 @@ policy-ref name, and starts a local Omni Gateway plus an `httpbin` backend via
 ## Sample config
 
 `config/api.yaml` caches discovery for 60s and enables caching for two example
-tools (`search` at `shared` scope, `get_my_profile` at `identity` scope).
+tools (`search` at `shared` scope, `get_my_profile` at `partitioned` scope with
+the top-level `partition` strategy keying by the `principal` preset).
 
 ## Smoke test
 

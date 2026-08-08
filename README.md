@@ -13,7 +13,7 @@ external dependency.**
 > guardrail — covered by unit tests (the full `decide` decision matrix, both
 > cache backends, keying, and guardrails) and by pdk-test integration tests
 > against a real Flex Gateway (discovery miss→hit with `id` re-stamp, tool-call
-> miss→hit, `no-cache` bypass, non-MCP pass-through, identity-scope
+> miss→hit, `no-cache` bypass, non-MCP pass-through, partitioned-scope
 > partitioning, and `maxEntries` LRU eviction). See
 > [`docs/architecture.md`](docs/architecture.md) for the full design.
 
@@ -42,13 +42,21 @@ JSON-RPC parsing surface and stack in the same policy chain.
 |---|---|---|---|
 | `discovery.cacheable` | boolean | `true` | Cache `tools/list` / `resources/list` / `prompts/list`. |
 | `discovery.ttl` | integer (s) | `60` | TTL for discovery entries. `0` disables discovery caching. |
+| `discovery.methods` | array | absent (all) | Which discovery methods to cache. Absent caches all three; a subset caches only those; empty caches none. |
 | `tools` | array | `[]` | Per-tool cache table. A tool not listed is passed through (never cached). |
 | `tools[].name` | string | — (required) | Exact MCP tool name (`params.name`). |
 | `tools[].cacheable` | boolean | `false` | Enable caching for this tool. |
 | `tools[].ttl` | integer (s) | — (required) | Max entry lifetime. |
-| `tools[].scope` | `shared` \| `identity` | `shared` | `shared` = tool + canonical args; `identity` also partitions by principal + MCP session id. |
+| `tools[].scope` | `shared` \| `partitioned` | `shared` | `shared` = tool + canonical args; `partitioned` also partitions the key by the top-level `partition` strategy. |
+| `partition` | object | — | Partition strategy shared by all `partitioned`-scope tools. Ignored by `shared` tools and discovery. |
+| `partition.mode` | `presets` \| `dataweave` | `presets` | `presets` uses `partitionBy`; `dataweave` uses `partitionKey`. |
+| `partition.partitionBy` | array | `[principal]` | Preset sources: `principal` (`x-forwarded-user`), `session` (`mcp-session-id`), or `header:<Name>`. Combined into the key; if none resolve, the request is not cached. |
+| `partition.partitionKey` | dataweave | `#[null]` | DataWeave expression over request attributes; its value partitions the key. Resolves to null/empty → not cached. |
 | `maxEntries` | integer | `1000` | Cache size cap. Hard LRU in local mode; soft/TTL-bound in distributed mode. |
 | `distributed` | boolean | `false` | Share the cache across replicas via gossip-replicated storage (no Redis). |
+
+To partition different tools by different strategies, apply the policy twice —
+all `partitioned` tools in one application share the single `partition` strategy.
 
 ## Behavior
 

@@ -28,7 +28,7 @@ fn parses_full_config() {
     let p = policy(
         r#"{
             "discovery": {"cacheable": false, "ttl": 30},
-            "tools": [{"name": "search", "cacheable": true, "ttl": 120, "scope": "identity"}],
+            "tools": [{"name": "search", "cacheable": true, "ttl": 120, "scope": "partitioned"}],
             "maxEntries": 500,
             "distributed": true
         }"#,
@@ -40,7 +40,7 @@ fn parses_full_config() {
     let search = p.tools.get("search").expect("search tool resolved");
     assert!(search.cacheable);
     assert_eq!(search.ttl, 120);
-    assert_eq!(search.scope, CacheScope::Identity);
+    assert_eq!(search.scope, CacheScope::Partitioned);
 }
 
 #[test]
@@ -60,7 +60,7 @@ fn discovery_ttl_zero_disables_discovery() {
 
 // --- key.rs -----------------------------------------------------------------
 
-use crate::key::{cache_key, canonicalize, CacheScope, Identity};
+use crate::key::{cache_key, canonicalize, CacheScope, PartitionSource};
 use serde_json::json;
 
 #[test]
@@ -78,33 +78,50 @@ fn canonicalize_distinguishes_values() {
 #[test]
 fn shared_key_is_deterministic_and_prefixed() {
     let p = json!({"q": "hi"});
-    let id = Identity { principal: None, session: None };
-    let k1 = cache_key("tools/call", &p, CacheScope::Shared, &id).unwrap();
-    let k2 = cache_key("tools/call", &p, CacheScope::Shared, &id).unwrap();
+    let k1 = cache_key("tools/call", &p, CacheScope::Shared, &[]).unwrap();
+    let k2 = cache_key("tools/call", &p, CacheScope::Shared, &[]).unwrap();
     assert_eq!(k1, k2);
     assert!(k1.starts_with("tools/call:"));
 }
 
 #[test]
-fn identity_key_partitions_by_principal() {
+fn partitioned_key_distinguishes_values() {
     let p = json!({});
-    let a = Identity { principal: Some("alice"), session: None };
-    let b = Identity { principal: Some("bob"), session: None };
-    let ka = cache_key("tools/call", &p, CacheScope::Identity, &a).unwrap();
-    let kb = cache_key("tools/call", &p, CacheScope::Identity, &b).unwrap();
+    let ka = cache_key("tools/call", &p, CacheScope::Partitioned, &["alice".into()]).unwrap();
+    let kb = cache_key("tools/call", &p, CacheScope::Partitioned, &["bob".into()]).unwrap();
     assert_ne!(ka, kb);
+    // Same value → same key (deterministic).
+    let ka2 = cache_key("tools/call", &p, CacheScope::Partitioned, &["alice".into()]).unwrap();
+    assert_eq!(ka, ka2);
 }
 
 #[test]
-fn identity_key_absent_when_no_principal_or_session() {
-    let id = Identity { principal: None, session: None };
-    assert!(cache_key("tools/call", &json!({}), CacheScope::Identity, &id).is_none());
+fn partitioned_key_absent_when_no_values() {
+    assert!(cache_key("tools/call", &json!({}), CacheScope::Partitioned, &[]).is_none());
 }
 
 #[test]
-fn identity_key_present_with_only_session() {
-    let id = Identity { principal: None, session: Some("s1") };
-    assert!(cache_key("tools/call", &json!({}), CacheScope::Identity, &id).is_some());
+fn partitioned_key_is_order_sensitive_across_multiple_values() {
+    let p = json!({});
+    let ab = cache_key("tools/call", &p, CacheScope::Partitioned, &["a".into(), "b".into()]);
+    let ba = cache_key("tools/call", &p, CacheScope::Partitioned, &["b".into(), "a".into()]);
+    assert_ne!(ab, ba, "value order participates in the key");
+    // A single value produces a distinct key from two values.
+    let single = cache_key("tools/call", &p, CacheScope::Partitioned, &["a".into()]);
+    assert_ne!(ab, single);
+}
+
+#[test]
+fn partition_source_parse() {
+    assert_eq!(PartitionSource::parse("principal"), Some(PartitionSource::Principal));
+    assert_eq!(PartitionSource::parse("SESSION"), Some(PartitionSource::Session));
+    assert_eq!(
+        PartitionSource::parse("header:X-Tenant-Id"),
+        Some(PartitionSource::Header("x-tenant-id".into()))
+    );
+    assert_eq!(PartitionSource::parse("header:"), None);
+    assert_eq!(PartitionSource::parse("bogus"), None);
+    assert_eq!(PartitionSource::parse(""), None);
 }
 
 // --- store.rs ---------------------------------------------------------------
@@ -184,7 +201,7 @@ async fn records_and_reads_unsafe_tools() {
 // `decide` is the heart of the request filter: it maps a parsed MCP request +
 // resolved config + observed-annotation state to Cache|Bypass. These cover
 // every branch (notification, discovery on/off, tools/call allowlist +
-// cacheable + missing-name + observed-unsafe, identity scope, unknown method)
+// cacheable + missing-name + observed-unsafe, partitioned scope, unknown method)
 // without the Docker harness.
 
 use crate::mcp::{McpRequest, RequestId};
@@ -203,9 +220,10 @@ fn is_cache(d: &Decision) -> bool {
     matches!(d, Decision::Cache { .. })
 }
 
-/// Identity with neither principal nor session.
-fn anon() -> Identity<'static> {
-    Identity { principal: None, session: None }
+/// No resolved partition values (shared scope, or a partitioned scope whose
+/// strategy resolved to nothing).
+fn anon() -> Vec<String> {
+    Vec::new()
 }
 
 #[tokio::test]
@@ -306,24 +324,65 @@ async fn decide_tools_call_observed_unsafe_bypasses_even_if_allowlisted() {
 }
 
 #[tokio::test]
-async fn decide_identity_scope_bypasses_without_principal_or_session() {
+async fn decide_partitioned_scope_bypasses_without_resolved_values() {
     let p = policy(
-        r#"{"discovery":{},"tools":[{"name":"me","cacheable":true,"ttl":90,"scope":"identity"}]}"#,
+        r#"{"discovery":{},"tools":[{"name":"me","cacheable":true,"ttl":90,"scope":"partitioned"}]}"#,
     );
     let store = LocalStore::new(MockCache::new());
     let d = decide(&p, &store, &req("tools/call", Some("me")), &json!({}), &anon()).await;
-    assert!(!is_cache(&d), "identity scope with no principal/session must bypass");
+    assert!(!is_cache(&d), "partitioned scope with no resolved values must bypass");
 }
 
 #[tokio::test]
-async fn decide_identity_scope_caches_with_principal() {
+async fn decide_partitioned_scope_caches_with_a_value() {
     let p = policy(
-        r#"{"discovery":{},"tools":[{"name":"me","cacheable":true,"ttl":90,"scope":"identity"}]}"#,
+        r#"{"discovery":{},"tools":[{"name":"me","cacheable":true,"ttl":90,"scope":"partitioned"}]}"#,
     );
     let store = LocalStore::new(MockCache::new());
-    let id = Identity { principal: Some("alice"), session: None };
-    let d = decide(&p, &store, &req("tools/call", Some("me")), &json!({}), &id).await;
-    assert!(is_cache(&d), "identity scope with a principal should cache");
+    let parts = vec!["alice".to_string()];
+    let d = decide(&p, &store, &req("tools/call", Some("me")), &json!({}), &parts).await;
+    assert!(is_cache(&d), "partitioned scope with a resolved value should cache");
+}
+
+// --- discovery.methods subset selection -------------------------------------
+
+#[tokio::test]
+async fn decide_discovery_methods_subset_caches_only_listed() {
+    // Only tools/list is enabled; resources/list and prompts/list bypass.
+    let p = policy(
+        r#"{"discovery":{"cacheable":true,"ttl":60,"methods":["tools/list"]}}"#,
+    );
+    let store = LocalStore::new(MockCache::new());
+    assert!(
+        is_cache(&decide(&p, &store, &req("tools/list", None), &json!({}), &anon()).await),
+        "listed method caches"
+    );
+    for method in ["resources/list", "prompts/list"] {
+        let d = decide(&p, &store, &req(method, None), &json!({}), &anon()).await;
+        assert!(!is_cache(&d), "{method} not in subset must bypass");
+    }
+}
+
+#[tokio::test]
+async fn decide_discovery_methods_empty_caches_none() {
+    // Explicit empty list = cache no discovery methods.
+    let p = policy(r#"{"discovery":{"cacheable":true,"ttl":60,"methods":[]}}"#);
+    let store = LocalStore::new(MockCache::new());
+    for method in ["tools/list", "resources/list", "prompts/list"] {
+        let d = decide(&p, &store, &req(method, None), &json!({}), &anon()).await;
+        assert!(!is_cache(&d), "{method} bypasses when methods list is empty");
+    }
+}
+
+#[tokio::test]
+async fn decide_discovery_methods_absent_caches_all() {
+    // Absent list = cache all three (back-compat with pre-1.1 configs).
+    let p = policy(r#"{"discovery":{"cacheable":true,"ttl":60}}"#);
+    let store = LocalStore::new(MockCache::new());
+    for method in ["tools/list", "resources/list", "prompts/list"] {
+        let d = decide(&p, &store, &req(method, None), &json!({}), &anon()).await;
+        assert!(is_cache(&d), "{method} caches when methods list is absent");
+    }
 }
 
 // --- GossipStore (distributed backend) --------------------------------------

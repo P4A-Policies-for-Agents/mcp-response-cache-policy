@@ -20,7 +20,7 @@ mod mcp;
 mod store;
 
 use crate::generated::config::Config;
-use crate::key::{cache_key, CacheScope, Identity};
+use crate::key::{cache_key, CacheScope, PartitionSource};
 use crate::mcp::{
     is_cacheable_response, is_discovery_method, is_notification, parse_request, restamp_id,
     McpRequest, TOOLS_CALL, TOOLS_LIST,
@@ -31,8 +31,13 @@ use pdk::cache::CacheBuilder;
 use pdk::data_storage::DataStorageBuilder;
 use pdk::hl::*;
 use pdk::logger;
-use std::collections::HashMap;
+use pdk::script::{HandlerAttributesBinding, Script, Value as DwValue};
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+
+/// Request headers backing the two built-in partition presets.
+const PRINCIPAL_HEADER: &str = "x-forwarded-user";
+const SESSION_HEADER: &str = "mcp-session-id";
 
 const POLICY_NAME: &str = "mcp-response-cache-policy";
 const CACHE_ID: &str = "mcp-response-cache";
@@ -94,11 +99,27 @@ struct ToolConfig {
     scope: CacheScope,
 }
 
+/// Whether partitioned-scope tools resolve their key from the preset
+/// `partitionBy` list or from the `partitionKey` DataWeave expression.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PartitionMode {
+    Presets,
+    Dataweave,
+}
+
 /// Immutable per-worker view of config, precomputed for O(1) tool lookup.
 struct Policy {
     discovery_cacheable: bool,
     discovery_ttl: u64,
+    /// When `Some`, cache only these discovery methods; `None` = all three.
+    discovery_methods: Option<HashSet<String>>,
     tools: HashMap<String, ToolConfig>,
+    /// Partition strategy for `partitioned`-scope tools.
+    partition_mode: PartitionMode,
+    /// Preset sources, in order (mode = Presets). Unparseable entries dropped.
+    partition_by: Vec<PartitionSource>,
+    /// DataWeave key expression (mode = Dataweave), compiled by config-gen.
+    partition_key: Option<Script>,
 }
 
 impl Policy {
@@ -112,6 +133,13 @@ impl Policy {
             .ttl
             .map(|t| t.max(0) as u64)
             .unwrap_or(DEFAULT_DISCOVERY_TTL);
+
+        // Empty list is an explicit "cache none"; absent list means "cache all".
+        let discovery_methods = config
+            .discovery
+            .methods
+            .as_ref()
+            .map(|m| m.iter().cloned().collect::<HashSet<String>>());
 
         let tools = config
             .tools
@@ -129,11 +157,42 @@ impl Policy {
             })
             .collect();
 
+        // Partition strategy (shared by all partitioned tools). Absent block =
+        // presets with the gcl default (`principal`).
+        let partition = config.partition.as_ref();
+        let partition_mode = match partition.and_then(|p| p.mode.as_deref()) {
+            Some("dataweave") => PartitionMode::Dataweave,
+            _ => PartitionMode::Presets,
+        };
+        let partition_by = partition
+            .and_then(|p| p.partition_by.as_ref())
+            .map(|list| {
+                list.iter()
+                    .filter_map(|s| PartitionSource::parse(s))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| vec![PartitionSource::Principal]);
+        let partition_key = partition.and_then(|p| p.partition_key.clone());
+
         Self {
             discovery_cacheable: discovery_cacheable && discovery_ttl > 0,
             discovery_ttl,
+            discovery_methods,
             tools,
+            partition_mode,
+            partition_by,
+            partition_key,
         }
+    }
+
+    /// True iff this discovery method should be cached (subset selection).
+    fn discovery_method_enabled(&self, method: &str) -> bool {
+        self.discovery_cacheable
+            && self
+                .discovery_methods
+                .as_ref()
+                .map(|set| set.contains(method))
+                .unwrap_or(true)
     }
 }
 
@@ -148,7 +207,7 @@ async fn decide<S: CacheStore>(
     store: &S,
     req: &McpRequest,
     params: &serde_json::Value,
-    identity: &Identity<'_>,
+    parts: &[String],
 ) -> Decision {
     // Notifications and unknown methods never cache.
     if is_notification(&req.method) {
@@ -156,7 +215,7 @@ async fn decide<S: CacheStore>(
     }
 
     let (ttl, scope) = if is_discovery_method(&req.method) {
-        if !policy.discovery_cacheable {
+        if !policy.discovery_method_enabled(&req.method) {
             return Decision::Bypass;
         }
         (policy.discovery_ttl, CacheScope::Shared)
@@ -173,19 +232,71 @@ async fn decide<S: CacheStore>(
         if crate::annotations::is_known_unsafe(store, name).await {
             return Decision::Bypass;
         }
-        (tool.ttl, tool.scope.clone())
+        (tool.ttl, tool.scope)
     } else {
         return Decision::Bypass;
     };
 
-    match cache_key(&req.method, params, scope, identity) {
+    match cache_key(&req.method, params, scope, parts) {
         Some(key) => Decision::Cache { key, ttl },
-        None => Decision::Bypass, // identity scope with no principal/session
+        None => Decision::Bypass, // partitioned scope that resolved to nothing
+    }
+}
+
+/// Coerce a DataWeave partition-key result to a single key string. A scalar
+/// yields its value; null / array / object yields `None` (nothing to partition
+/// on → the caller bypasses).
+fn dw_value_to_key(v: DwValue) -> Option<String> {
+    match v {
+        DwValue::String(s) if !s.is_empty() => Some(s),
+        DwValue::String(_) => None,
+        DwValue::Bool(b) => Some(b.to_string()),
+        DwValue::Number(n) => Some(n.to_string()),
+        DwValue::Null | DwValue::Array(_) | DwValue::Object(_) => None,
+    }
+}
+
+/// Resolve the per-request partition values from the request headers (presets)
+/// or the DataWeave key expression, in `partitionBy` order. Only values that
+/// actually resolve are returned; an absent header / null expression is
+/// dropped, so an all-absent result is an empty Vec (⇒ partitioned bypass).
+fn resolve_partition_values(
+    policy: &Policy,
+    handler: &dyn HeadersHandler,
+    stream: &StreamProperties,
+) -> Vec<String> {
+    match policy.partition_mode {
+        PartitionMode::Presets => policy
+            .partition_by
+            .iter()
+            .filter_map(|src| match src {
+                PartitionSource::Principal => handler.header(PRINCIPAL_HEADER),
+                PartitionSource::Session => handler.header(SESSION_HEADER),
+                PartitionSource::Header(name) => handler.header(name),
+            })
+            .filter(|v| !v.is_empty())
+            .collect(),
+        PartitionMode::Dataweave => {
+            let script = match &policy.partition_key {
+                Some(s) => s,
+                None => return Vec::new(),
+            };
+            let mut ev = script.evaluator();
+            ev.bind_attributes(&HandlerAttributesBinding::new(handler, stream));
+            match ev.eval() {
+                Ok(v) => dw_value_to_key(v).into_iter().collect(),
+                Err(e) => {
+                    logger::warn!("[{}] partitionKey eval failed: {}", POLICY_NAME, e);
+                    Vec::new()
+                }
+            }
+        }
     }
 }
 
 async fn request_filter<S: CacheStore>(
     request_state: RequestState,
+    stream: StreamProperties,
     policy: &Policy,
     store: &S,
 ) -> Flow<MissCtx> {
@@ -210,9 +321,10 @@ async fn request_filter<S: CacheStore>(
         return Flow::Continue(MissCtx::bypass(String::new()));
     }
 
-    // Capture identity headers before consuming the state for the body.
-    let principal = handler.header("x-forwarded-user");
-    let session = handler.header("mcp-session-id");
+    // Resolve partition values before consuming the state for the body — the
+    // DataWeave attributes binding borrows the header handler. Shared-scope and
+    // discovery requests ignore these; only partitioned tools consume them.
+    let parts = resolve_partition_values(policy, handler, &stream);
 
     let body_state = headers_state.into_body_state().await;
     let body = body_state.handler().body();
@@ -228,12 +340,7 @@ async fn request_filter<S: CacheStore>(
         .and_then(|v| v.get("params").cloned())
         .unwrap_or(serde_json::Value::Null);
 
-    let identity = Identity {
-        principal: principal.as_deref(),
-        session: session.as_deref(),
-    };
-
-    match decide(policy, store, &req, &params, &identity).await {
+    match decide(policy, store, &req, &params, &parts).await {
         Decision::Bypass => Flow::Continue(MissCtx::bypass(req.method)),
         Decision::Cache { key, ttl } => {
             if let Some(entry) = store.get(&key).await {
@@ -325,10 +432,10 @@ async fn launch_policy<S: CacheStore + 'static>(
     let req_store = store.clone();
     let resp_store = store.clone();
 
-    let filter = on_request(move |rs| {
+    let filter = on_request(move |rs, stream: StreamProperties| {
         let policy = req_policy.clone();
         let store = req_store.clone();
-        async move { request_filter(rs, &policy, store.as_ref()).await }
+        async move { request_filter(rs, stream, &policy, store.as_ref()).await }
     })
     .on_response(move |rs, req_data| {
         let store = resp_store.clone();
@@ -361,14 +468,24 @@ async fn configure(
         .map(|m| m.max(1) as u32)
         .unwrap_or(DEFAULT_MAX_ENTRIES);
 
+    let partition_desc = match policy.partition_mode {
+        PartitionMode::Presets => format!("presets({})", policy.partition_by.len()),
+        PartitionMode::Dataweave => "dataweave".to_string(),
+    };
     logger::info!(
-        "[{}] configured (distributed={}, max_entries={}, tools={}, discovery.cacheable={}, discovery.ttl={}s)",
+        "[{}] configured (distributed={}, max_entries={}, tools={}, discovery.cacheable={}, discovery.ttl={}s, discovery.methods={}, partition={})",
         POLICY_NAME,
         distributed,
         max_entries,
         policy.tools.len(),
         policy.discovery_cacheable,
         policy.discovery_ttl,
+        policy
+            .discovery_methods
+            .as_ref()
+            .map(|s| s.len().to_string())
+            .unwrap_or_else(|| "all".to_string()),
+        partition_desc,
     );
 
     if distributed {

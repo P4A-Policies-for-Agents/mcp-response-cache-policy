@@ -5,7 +5,7 @@
 
 [package]
 name = "mcp_response_cache_policy"
-version = "1.0.0"
+version = "1.1.0"
 rust-version = "1.88.0"
 edition = "2021"
 resolver = "2"
@@ -16,7 +16,7 @@ crate-type = ["cdylib"]
 
 [package.metadata.anypoint]
 group_id = "00000000-0000-0000-0000-000000000000"
-definition_asset_id = { name = "mcp-response-cache", version = "1.0.0" }
+definition_asset_id = { name = "mcp-response-cache", version = "1.1.0" }
 implementation_asset_id = "mcp-response-cache-policy-flex"
 
 [dependencies]

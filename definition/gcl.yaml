@@ -39,6 +39,21 @@ spec:
             disable discovery caching regardless of the Cache Discovery flag.
           default: 60
           minimum: 0
+        methods:
+          type: array
+          title: Discovery Methods
+          uniqueItems: true
+          description: >-
+            Which discovery methods to cache. Leave empty to cache all three
+            (tools/list, resources/list, prompts/list) — the default. Select a
+            subset to cache only those; a discovery method not listed is passed
+            through (never cached).
+          items:
+            type: string
+            enum:
+              - tools/list
+              - resources/list
+              - prompts/list
     tools:
       type: array
       title: Cacheable Tools
@@ -73,16 +88,62 @@ spec:
             title: Cache Scope
             description: >-
               shared = key on tool name + canonical arguments (one entry shared
-              across all callers). identity = also partition by authenticated
-              principal and MCP session id (per-caller isolation); if neither is
-              present the call is not cached.
+              across all callers). partitioned = also partition the key by the
+              top-level Partition strategy (per-caller or per-tenant isolation);
+              if the strategy resolves to nothing the call is not cached.
             enum:
               - shared
-              - identity
+              - partitioned
             default: shared
         required:
           - name
           - ttl
+    partition:
+      type: object
+      title: Partition Strategy
+      description: >-
+        How to partition the cache key for tools with scope = partitioned. All
+        partitioned tools share this one strategy; to partition different tools
+        differently, apply the policy a second time. Ignored by shared-scope
+        tools and by discovery caching.
+      properties:
+        mode:
+          type: string
+          title: Partition Mode
+          description: >-
+            presets = partition by the no-code Partition By list below.
+            dataweave = partition by the Partition Key DataWeave expression
+            below. The unused field is ignored.
+          enum:
+            - presets
+            - dataweave
+          default: presets
+        partitionBy:
+          type: array
+          title: Partition By
+          description: >-
+            Used when mode = presets. Each entry is one partition source:
+            "principal" (the x-forwarded-user header), "session" (the
+            mcp-session-id header), or "header:<Name>" for any request header
+            (e.g. "header:x-tenant-id"). Sources are combined into the key; if
+            NONE of them resolve to a value on a request, that request is not
+            cached (never cache under a weak key).
+          items:
+            type: string
+          default:
+            - principal
+        partitionKey:
+          type: string
+          format: dataweave
+          title: Partition Key (DataWeave)
+          description: >-
+            Used when mode = dataweave. A DataWeave expression evaluated per
+            request against request attributes (headers); its value partitions
+            the cache key. Example: #[attributes.headers['x-tenant-id']]. If it
+            resolves to null/empty, the request is not cached.
+          default: "#[null]"
+          bindings:
+            attributes: true
     maxEntries:
       type: integer
       title: Max Entries

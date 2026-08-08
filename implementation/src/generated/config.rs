@@ -3,8 +3,19 @@ use serde::Deserialize;
 pub struct DiscoveryConfig {
     #[serde(alias = "cacheable")]
     pub cacheable: Option<bool>,
+    #[serde(alias = "methods")]
+    pub methods: Option<Vec<String>>,
     #[serde(alias = "ttl")]
     pub ttl: Option<i64>,
+}
+#[derive(Deserialize, Clone, Debug)]
+pub struct PartitionConfig {
+    #[serde(alias = "mode")]
+    pub mode: Option<String>,
+    #[serde(alias = "partitionBy")]
+    pub partition_by: Option<Vec<String>>,
+    #[serde(alias = "partitionKey", default, deserialize_with = "de_partition_key_0")]
+    pub partition_key: Option<pdk::script::Script>,
 }
 #[derive(Deserialize, Clone, Debug)]
 pub struct Tools0Config {
@@ -25,6 +36,8 @@ pub struct Config {
     pub distributed: Option<bool>,
     #[serde(alias = "maxEntries")]
     pub max_entries: Option<i64>,
+    #[serde(alias = "partition")]
+    pub partition: Option<PartitionConfig>,
     #[serde(alias = "tools")]
     pub tools: Option<Vec<Tools0Config>>,
 }
@@ -32,4 +45,21 @@ pub struct Config {
 fn init(abi: &dyn pdk::flex_abi::api::FlexAbi) -> Result<(), anyhow::Error> {
     abi.setup()?;
     Ok(())
+}
+fn de_partition_key_0<'de, D>(
+    deserializer: D,
+) -> Result<Option<pdk::script::Script>, D::Error>
+where
+    D: serde::de::Deserializer<'de>,
+{
+    let exp: Option<pdk::script::Expression> = serde::de::Deserialize::deserialize(
+        deserializer,
+    )?;
+    exp.map(|exp| {
+            pdk::script::ScriptingEngine::script(&exp)
+                .input(pdk::script::Input::Attributes)
+                .compile()
+                .map_err(serde::de::Error::custom)
+        })
+        .transpose()
 }
