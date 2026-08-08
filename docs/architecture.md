@@ -261,7 +261,9 @@ at `configure()` for O(1) lookup).
   (hit does not reach backend); allowlisted read-only `tools/call` miss→hit;
   `Cache-Control: no-cache` bypass; non-MCP body pass-through (never cached);
   identity-scope partitioning by `x-forwarded-user` principal; `maxEntries`
-  LRU eviction (local backend, dedicated composite).
+  LRU eviction (local backend, dedicated composite in its own `tests/eviction.rs`
+  binary so it runs in a separate process and never races the leaked shared
+  composite).
 
 ## 9. Non-Goals (v1)
 
