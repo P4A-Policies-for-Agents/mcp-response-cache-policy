@@ -39,7 +39,7 @@ This is the RFC 9111 shared-cache model adapted to MCP. Two twists:
 | HTTP cache | This policy |
 |---|---|
 | Cacheable = method is `GET` | Everything is `POST`+JSON-RPC → "safe" comes from the **JSON-RPC method** (`*/list`) and the **operator allowlist + `readOnlyHint`/`destructiveHint`** |
-| Key = URL + query (+`Vary`) | Key = JSON-RPC `method` + canonicalized `params` (hashed); `Vary` ≈ our `identity` scope |
+| Key = URL + query (+`Vary`) | Key = JSON-RPC `method` + canonicalized `params` (hashed); `Vary` ≈ our `partitioned` scope |
 | TTL from response `Cache-Control` | Upstream sends no cache headers → TTL is **operator-configured** |
 | Bypass via `Cache-Control: no-cache` | Same header, reused verbatim |
 | Revalidation via ETag/`304` | No MCP equivalent — expire and re-fetch |
@@ -132,13 +132,14 @@ parse JSON-RPC envelope ── not parseable / not MCP ─→ Continue, bypass
 branch on method:
   discovery (tools/list | resources/list | prompts/list):
       cache only if discovery.cacheable AND discovery.ttl > 0
+      AND the method is in discovery.methods (absent list = all three)
   tools/call:
       look up per-tool table by params.name
       absent OR cacheable:false ─→ Continue (pass-through, bypass)
 guardrails (any true ─→ Continue, x-mcp-cache: bypass):
   • Cache-Control: no-cache present on the request
   • tool observed as destructive / lacking readOnlyHint (§5)
-  • identity scope required but neither principal nor session present
+  • partitioned scope required but the partition strategy resolved to nothing
 build key (§ key construction)
 cache.get(key):
   HIT  → Flow::Break(stored JSON-RPC result, id RE-STAMPED to THIS request's id)
@@ -196,14 +197,28 @@ or a notifications-only stream aborts the collapse (`None`). The gate is exactly
 ```
 canonical_params = recursively sort object keys of params (BTreeMap) → serialize
 base = sha256( method || 0x1e || canonical_params )
-scope == shared    → key = "{method}:{base}"
-scope == identity  → key = "{method}:{base}:{sha256(principal)}:{sha256(session)}"
+scope == shared       → key = "{method}:{base}"
+scope == partitioned  → resolve partition values v1..vn (see below), then
+                        key = "{method}:{base}:{sha256(v1)}:…:{sha256(vn)}"
+                        (empty resolution ⇒ no key ⇒ bypass)
 ```
+
+**Partition value resolution** (one shared strategy for all `partitioned` tools,
+set by the top-level `partition` object):
+
+- `mode: presets` — each `partitionBy` entry names a source: `principal`
+  (the `x-forwarded-user` header), `session` (the `mcp-session-id` header), or
+  `header:<Name>` (any request header). The values that resolve, in list order,
+  are appended to the key. If **none** resolve, the request is not cached.
+- `mode: dataweave` — the `partitionKey` DataWeave expression is evaluated per
+  request against request attributes; a scalar result partitions the key, a
+  `null`/empty/non-scalar result means "nothing to partition on" ⇒ bypass.
 
 - Canonicalization collapses `{a,b}` and `{b,a}` to one key (stable ordering).
 - Sensitive values participating in the key are **hashed, never stored raw**
   (SHA-256), per the caching skill's key rules.
-- Keys are deterministic: same inputs → same key.
+- Value order is significant (the resolver preserves `partitionBy` order), so
+  keys are deterministic: same inputs → same key.
 
 ### Never cached (guardrails, all fail-open)
 
@@ -216,6 +231,9 @@ scope == identity  → key = "{method}:{base}:{sha256(principal)}:{sha256(sessio
 - Non-allowlisted tools (default `cacheable:false` ⇒ pass-through).
 - Side-effecting tools — honors observed MCP annotations (`destructiveHint`,
   absence of `readOnlyHint`); never cached even if allowlisted (§5).
+- Discovery methods not in `discovery.methods` (when a subset is configured).
+- `partitioned`-scope calls whose partition strategy resolves to no value —
+  never cached under a weak (unpartitioned) key.
 
 ### Failure modes
 
@@ -250,11 +268,16 @@ about. So safety cannot depend on having seen discovery.
 |---|---|---|---|
 | `discovery.cacheable` | boolean | Cache `tools/list` / `resources/list` / `prompts/list`. | `true` |
 | `discovery.ttl` | integer (s) | TTL for discovery entries. `0` ⇒ don't cache discovery. | `60` |
+| `discovery.methods` | array (enum) | Which discovery methods to cache. Absent ⇒ all three; a subset caches only those; empty ⇒ none. | absent (all) |
 | `tools` | array | Per-tool cache table. Absent tool ⇒ pass-through. | `[]` |
 | `tools[].name` | string | Tool name this entry configures (`params.name`). | — (req) |
 | `tools[].cacheable` | boolean | Enable caching for this tool. | `false` |
 | `tools[].ttl` | integer (s) | Max entry lifetime (capped, safety-margined). | — (req) |
-| `tools[].scope` | enum `shared`\|`identity` | `shared` = tool+canonical args; `identity` also keyed by principal + session. | `shared` |
+| `tools[].scope` | enum `shared`\|`partitioned` | `shared` = tool+canonical args; `partitioned` also keyed by the top-level `partition` strategy. | `shared` |
+| `partition` | object | Strategy shared by all `partitioned` tools (see below). Ignored by `shared` tools + discovery. | — |
+| `partition.mode` | enum `presets`\|`dataweave` | `presets` uses `partitionBy`; `dataweave` uses `partitionKey`. | `presets` |
+| `partition.partitionBy` | array (string) | Preset sources: `principal`, `session`, `header:<Name>`. Combined into the key; none resolving ⇒ bypass. | `[principal]` |
+| `partition.partitionKey` | dataweave | DataWeave expression over request attributes; its value partitions the key. `null`/empty ⇒ bypass. | `#[null]` |
 | `maxEntries` | integer | Cache size cap. Hard LRU (local) / soft, TTL-bound (distributed). | e.g. `1000` |
 | `distributed` | boolean | Use gossip-replicated backend for cross-replica hits. | `false` |
 
@@ -264,12 +287,24 @@ Top-level metadata labels: `title`, `description`, `category: MCP`,
 {type: object, ...}` → generated `Vec<Tools0Config>` → `HashMap<name, entry>`
 at `configure()` for O(1) lookup).
 
+**Why `partition` is one top-level object, not per-tool.** PDK's `dw2pel` config
+transform compiles `format: dataweave` at the top level and nested in objects,
+but **not inside array items** — a `partitionKey` declared inside `tools[]` would
+reach the policy uncompiled and 503 the whole config. So the partition strategy
+lives once at the top level and every `partitioned` tool shares it; to partition
+different tools differently, apply the policy twice. Both `partitionBy` and
+`partitionKey` are always present in the schema (no `@visibleOn` gate — combining
+it with `format: dataweave` also 503s); `mode` selects which the runtime honors.
+
 ### Resolved open questions
 
 1. **Discovery default TTL → 60s** (configurable; `0`/absent = off). Discovery
    rarely changes within a minute; Drift/Poisoning policies stack alongside.
-2. **Identity scope → principal + `Mcp-Session-Id`**, degrade to whichever is
-   present; if **neither**, bypass (never cache under a weak key).
+2. **Partitioned scope → a configurable strategy** (`partition` object): presets
+   (`principal` / `session` / `header:<Name>`) or a DataWeave `partitionKey`.
+   Values that resolve are hashed into the key in order; if **none** resolve,
+   bypass (never cache under a weak key). Replaces the fixed principal+session
+   `identity` scope of 1.0.
 3. **Bypass hint → honor `Cache-Control: no-cache`** on the request
    (transport-level; agents set it without mutating the RPC body). On bypass:
    force upstream, still store the fresh result, emit `x-mcp-cache: bypass`.
@@ -285,10 +320,11 @@ at `configure()` for O(1) lookup).
 
 - **Unit (`pdk-unit`):** envelope parse (numeric/string/null `id`, malformed /
   non-JSON-RPC), key canonicalization idempotence + value-sensitivity + scope
-  partitioning, the full `decide()` decision matrix (notification, unknown
-  method, discovery on/off/ttl-0, `tools/call` allowlist ×
-  cacheable × missing-name × observed-destructive, identity scope with/without
-  principal), response guardrails (`error`/`isError`/no-`result`), tool-safety
+  partitioning (shared, partitioned single/multi-value/order-sensitive/absent)
+  + `PartitionSource::parse`, the full `decide()` decision matrix (notification,
+  unknown method, discovery on/off/ttl-0/methods-subset/empty/absent, `tools/call`
+  allowlist × cacheable × missing-name × observed-destructive, partitioned scope
+  with/without resolved values), response guardrails (`error`/`isError`/no-`result`), tool-safety
   annotation extraction + observed-unsafe marker, `LocalStore` roundtrip + lazy
   expiry eviction, and `GossipStore` roundtrip + first-writer-wins +
   stale-without-tombstone + get-error-falls-open. Mock `Cache` and
@@ -297,7 +333,7 @@ at `configure()` for O(1) lookup).
   discovery miss→store→hit with `id` re-stamp and upstream hit-count assertion
   (hit does not reach backend); allowlisted read-only `tools/call` miss→hit;
   `Cache-Control: no-cache` bypass; non-MCP body pass-through (never cached);
-  identity-scope partitioning by `x-forwarded-user` principal; `maxEntries`
+  partitioned-scope partitioning by `x-forwarded-user` principal; `maxEntries`
   LRU eviction (local backend, dedicated composite in its own `tests/eviction.rs`
   binary so it runs in a separate process and never races the leaked shared
   composite).

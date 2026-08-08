@@ -19,26 +19,58 @@ pub enum CacheScope {
     /// Key on tool + canonical args only; one entry shared across all callers.
     #[default]
     Shared,
-    /// Also partition by authenticated principal and MCP session id.
-    Identity,
+    /// Also partition the key by the policy-level partition strategy
+    /// (presets or a DataWeave expression), resolved per request.
+    Partitioned,
 }
 
 impl CacheScope {
-    /// Parse the gcl `scope` string. Anything other than `"identity"`
+    /// Parse the gcl `scope` string. Anything other than `"partitioned"`
     /// (including absence) is the safe default, `Shared`.
     pub fn parse(scope: Option<&str>) -> Self {
         match scope {
-            Some("identity") => CacheScope::Identity,
+            Some("partitioned") => CacheScope::Partitioned,
             _ => CacheScope::Shared,
         }
     }
 }
 
-/// Caller identity for `identity`-scoped keys. Both fields optional; the key
-/// degrades to whichever is present.
-pub struct Identity<'a> {
-    pub principal: Option<&'a str>,
-    pub session: Option<&'a str>,
+/// One preset partition source (the `partitionBy` list, mode = presets). Parsed
+/// once at configure() and resolved per request against headers in `lib.rs`.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum PartitionSource {
+    /// The authenticated principal — the `x-forwarded-user` request header.
+    Principal,
+    /// The MCP session — the `mcp-session-id` request header.
+    Session,
+    /// An arbitrary request header, lower-cased. From `header:<Name>`.
+    Header(String),
+}
+
+impl PartitionSource {
+    /// Parse one `partitionBy` entry. Recognizes `principal`, `session`, and
+    /// `header:<Name>` (case-insensitive keyword; header name lower-cased for
+    /// case-insensitive lookup). Returns `None` for an empty/unrecognized entry.
+    pub fn parse(entry: &str) -> Option<Self> {
+        let e = entry.trim();
+        if e.eq_ignore_ascii_case("principal") {
+            Some(PartitionSource::Principal)
+        } else if e.eq_ignore_ascii_case("session") {
+            Some(PartitionSource::Session)
+        } else if let Some(name) = e
+            .strip_prefix("header:")
+            .or_else(|| e.strip_prefix("Header:"))
+        {
+            let name = name.trim();
+            if name.is_empty() {
+                None
+            } else {
+                Some(PartitionSource::Header(name.to_ascii_lowercase()))
+            }
+        } else {
+            None
+        }
+    }
 }
 
 /// Serialize `params` with all object keys recursively sorted, so `{a,b}` and
@@ -70,14 +102,25 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(h.finalize())
 }
 
-/// Build the cache key. Returns `None` for `identity` scope when neither
-/// principal nor session is available (caller must bypass — never cache under
-/// a weak key).
+/// Build the cache key from already-resolved partition values.
+///
+/// `parts` are the partition values resolved for THIS request (in `lib.rs`):
+/// for presets, one entry per `partitionBy` source that produced a value; for
+/// dataweave, the single evaluated key value. The caller passes only the values
+/// that actually resolved (absent sources are dropped, not passed as empty).
+///
+/// - `Shared` scope ignores `parts` and keys on tool + canonical args only.
+/// - `Partitioned` scope with a non-empty `parts` appends each value's SHA-256
+///   to the key, in the order given (order is significant, so the resolver must
+///   preserve `partitionBy` order).
+/// - `Partitioned` scope with an EMPTY `parts` returns `None` — the strategy
+///   resolved to nothing, so the caller must bypass rather than cache under a
+///   weak (unpartitioned) key.
 pub fn cache_key(
     method: &str,
     params: &Value,
     scope: CacheScope,
-    identity: &Identity,
+    parts: &[String],
 ) -> Option<String> {
     let canon = canonicalize(params);
     let mut preimage = Vec::with_capacity(method.len() + 1 + canon.len());
@@ -88,13 +131,16 @@ pub fn cache_key(
 
     match scope {
         CacheScope::Shared => Some(format!("{method}:{base}")),
-        CacheScope::Identity => {
-            if identity.principal.is_none() && identity.session.is_none() {
+        CacheScope::Partitioned => {
+            if parts.is_empty() {
                 return None;
             }
-            let p = sha256_hex(identity.principal.unwrap_or("").as_bytes());
-            let s = sha256_hex(identity.session.unwrap_or("").as_bytes());
-            Some(format!("{method}:{base}:{p}:{s}"))
+            let mut key = format!("{method}:{base}");
+            for value in parts {
+                key.push(':');
+                key.push_str(&sha256_hex(value.as_bytes()));
+            }
+            Some(key)
         }
     }
 }

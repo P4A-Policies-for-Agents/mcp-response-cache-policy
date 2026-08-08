@@ -17,8 +17,9 @@ spec:
         name: mcp-response-cache-policy-flex-v1-0 # Overridden during 'make run' execution
         namespace: default
       config:
-        # Cache discovery methods (tools/list, resources/list, prompts/list)
-        # for 60s — the highest-value entries agents re-issue on bootstrap.
+        # Cache discovery methods for 60s — the highest-value entries agents
+        # re-issue on bootstrap. Omit `methods` to cache all three (tools/list,
+        # resources/list, prompts/list); list a subset to cache only those.
         discovery:
           cacheable: true
           ttl: 60
@@ -28,11 +29,20 @@ spec:
             cacheable: true
             ttl: 120
             scope: shared
-          # A per-caller result — keyed by principal + MCP session id:
+          # A per-caller result — partitioned by the strategy below:
           - name: get_my_profile
             cacheable: true
             ttl: 30
-            scope: identity
+            scope: partitioned
+        # Partition strategy shared by every partitioned-scope tool. Presets
+        # mode keys the entry by the authenticated principal (x-forwarded-user);
+        # if no source resolves, the request is not cached. To partition by an
+        # arbitrary header use "header:x-tenant-id"; for a DataWeave expression
+        # set mode: dataweave and supply partitionKey.
+        partition:
+          mode: presets
+          partitionBy:
+            - principal
         # Local in-memory cache with hard LRU eviction at 1000 entries.
         maxEntries: 1000
         # Single-replica cache. Set true to share across replicas via gossip.

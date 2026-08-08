@@ -56,8 +56,10 @@ async fn setup_test() -> anyhow::Result<&'static TestSetup> {
                 { "name": "read_only_search", "cacheable": true, "ttl": 60, "scope": "shared" },
                 { "name": "stream_search", "cacheable": true, "ttl": 60, "scope": "shared" },
                 { "name": "interactive_call", "cacheable": true, "ttl": 60, "scope": "shared" },
-                { "name": "whoami", "cacheable": true, "ttl": 60, "scope": "identity" }
+                { "name": "whoami", "cacheable": true, "ttl": 60, "scope": "partitioned" }
             ],
+            // Partition by the authenticated principal (x-forwarded-user).
+            "partition": { "mode": "presets", "partitionBy": ["principal"] },
             "maxEntries": 1000,
             "distributed": false
         }))
@@ -447,11 +449,13 @@ async fn non_mcp_body_passes_through() -> anyhow::Result<()> {
 }
 
 #[pdk_test]
-async fn identity_scope_partitions_by_principal() -> anyhow::Result<()> {
+async fn partitioned_scope_partitions_by_principal() -> anyhow::Result<()> {
     let setup = setup_test().await?;
 
-    // `whoami` is an identity-scoped tool. Two different principals issuing the
-    // SAME arguments must NOT share a cache entry: each is a miss on first call.
+    // `whoami` is a partitioned-scope tool; the policy partitions by the
+    // `principal` preset (x-forwarded-user). Two different principals issuing
+    // the SAME arguments must NOT share a cache entry: each is a miss on first
+    // call.
     let upstream = setup
         .mock_server
         .mock_async(|when, then| {
