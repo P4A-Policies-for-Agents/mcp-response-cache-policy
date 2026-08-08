@@ -30,6 +30,10 @@ hex = "0.4"
 
 [dev-dependencies]
 pdk-unit = { version = "1.9.2" }
+pdk-test = { version = "1.9.2" }
+tokio = { version = "1", features = ["macros", "rt"] }
+httpmock = "0.6"
+reqwest = { version = "0.11", features = ["json"] }
 
 [profile.release]
 lto = true
