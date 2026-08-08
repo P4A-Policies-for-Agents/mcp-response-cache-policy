@@ -2,7 +2,7 @@
   "main": "gcl.yaml",
   "groupId": "00000000-0000-0000-0000-000000000000",
   "assetId": "mcp-response-cache",
-  "version": "1.1.0",
+  "version": "1.0.1",
   "name": "MCP Response Cache",
   "description": "Caches side-effect-free MCP responses (discovery */list and allowlisted read-only tools/call) at the gateway, so repeated agent calls are served locally instead of re-hitting the upstream. Cuts latency, load, and cost. PDK-only, no Redis."
 }

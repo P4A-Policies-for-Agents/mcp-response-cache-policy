@@ -2315,7 +2315,7 @@ dependencies = [
 
 [[package]]
 name = "mcp_response_cache_policy"
-version = "1.1.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "hex",
