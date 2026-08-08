@@ -5,11 +5,10 @@ metadata:
   labels:
     title: MCP Response Cache
     description: >-
-      Caches side-effect-free MCP responses (tools/list, resources/list,
-      prompts/list, and allowlisted read-only tools/call) at the gateway so
-      repeated agent calls are served locally instead of re-hitting the upstream
-      MCP server. Cuts latency, upstream load, and per-call cost. Uses PDK
-      DataStorage/Cache only — no Redis, no external dependency.
+      Caches side-effect-free MCP responses (discovery */list and allowlisted
+      read-only tools/call) at the gateway, so repeated agent calls are served
+      locally instead of re-hitting the upstream. Cuts latency, load, and cost.
+      PDK-only, no Redis.
     category: MCP
     metadata/interfaceScope: api
     metadata/capabilities/assetTypes: mcp
