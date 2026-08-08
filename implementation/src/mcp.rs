@@ -86,25 +86,77 @@ pub fn parse_request(body: &[u8]) -> Option<McpRequest> {
 
 // --- Response side ----------------------------------------------------------
 
-/// Extract the single JSON-RPC payload from a streamable-HTTP MCP response body.
+/// Classification of one JSON-RPC event parsed out of an SSE stream.
+enum RpcEvent {
+    /// A terminal success response (`id` + `result`, no `error`) — the payload
+    /// a cache would store. Carries the raw object bytes.
+    Terminal(Vec<u8>),
+    /// A fire-and-forget notification (`method`, no `id`) — droppable on replay.
+    Notification,
+    /// Anything that makes the stream unsafe to collapse: a server→client
+    /// request (`method` + `id`), a terminal error (`id` + `error`), a second
+    /// terminal, or a non-object / unrecognized payload.
+    Unsafe,
+}
+
+/// Classify a single SSE `data:` payload as a JSON-RPC event.
+fn classify_event(payload: &str) -> RpcEvent {
+    let v: Value = match serde_json::from_str(payload) {
+        Ok(v) => v,
+        Err(_) => return RpcEvent::Unsafe,
+    };
+    let obj = match v.as_object() {
+        Some(o) => o,
+        None => return RpcEvent::Unsafe,
+    };
+    let has_id = obj.get("id").map(|id| !id.is_null()).unwrap_or(false);
+    let has_method = obj.contains_key("method");
+
+    match (has_id, has_method) {
+        // Notification: method, no id — fire-and-forget, safe to drop on replay.
+        (false, true) => RpcEvent::Notification,
+        // Server→client request: method + id — needs a client response;
+        // collapsing to a cached result would skip that round-trip.
+        (true, true) => RpcEvent::Unsafe,
+        // Response: id, no method. Cacheable only if it is a clean success.
+        (true, false) => {
+            if obj.contains_key("error") || !obj.contains_key("result") {
+                RpcEvent::Unsafe
+            } else {
+                RpcEvent::Terminal(payload.as_bytes().to_vec())
+            }
+        }
+        // Neither id nor method — not a well-formed JSON-RPC event.
+        (false, false) => RpcEvent::Unsafe,
+    }
+}
+
+/// Extract the cacheable JSON-RPC payload from a streamable-HTTP MCP response
+/// body, normalizing transport framing.
 ///
-/// MCP's streamable-HTTP transport frames even a non-streaming, single-shot
-/// result as Server-Sent Events: one `event: message` block whose `data:` line
-/// carries the JSON-RPC object. This normalizes such a body to the raw JSON
-/// bytes so the rest of the response path (cacheability check, storage) can
-/// treat SSE-framed and bare-JSON responses uniformly.
+/// MCP's streamable-HTTP transport frames responses as Server-Sent Events, even
+/// the non-streaming single-shot results of the cacheable methods. This returns
+/// the raw JSON bytes of the terminal success response so the rest of the
+/// response path (cacheability check, storage) treats SSE-framed and bare-JSON
+/// responses uniformly. Returns `None` when the stream is not safe to collapse.
 ///
-/// Returns `Some(json_bytes)` only when the body contains **exactly one**
-/// `data:` payload that parses as a JSON object — i.e. a single-shot result.
-/// A body with multiple `data:` events is a genuine multi-event stream (progress
-/// notifications, chunked/streamed output) and is intentionally rejected
-/// (`None`): those must never be collapsed into one cached entry. A bare-JSON
-/// body (no SSE framing) is returned as-is when it parses as a JSON object.
+/// Cases:
+/// - **Bare JSON object** (no SSE framing) → returned as-is.
+/// - **Single-event SSE frame** whose data is a success response → unwrapped.
+/// - **Multi-event stream** of `(notification)* + exactly one success terminal`
+///   → the terminal is extracted; the fire-and-forget notifications are dropped
+///   (a "completed op that emitted progress"). This is safe because a cache hit
+///   replays only the terminal result, and the client never needed the
+///   progress frames.
+/// - **Unsafe stream** → `None`: any server→client request in the stream (a
+///   `method` **with** an `id` — sampling/elicitation/roots — needs a client
+///   round-trip), a terminal error, more than one terminal response, a
+///   notifications-only stream (no result to cache), or a non-object payload.
 ///
 /// Per the SSE spec, a `data:` value may span multiple consecutive `data:`
 /// lines within one event (joined with `\n`); this handles that. Comment lines
 /// (`:`), the `event:`/`id:`/`retry:` fields, and blank separators are ignored.
-pub fn extract_single_json(body: &[u8]) -> Option<Vec<u8>> {
+pub fn extract_cacheable_json(body: &[u8]) -> Option<Vec<u8>> {
     let text = std::str::from_utf8(body).ok()?;
 
     // Bare JSON (not SSE-framed): accept iff it is a JSON object.
@@ -146,15 +198,23 @@ pub fn extract_single_json(body: &[u8]) -> Option<Vec<u8>> {
         events.push(data);
     }
 
-    // Exactly one single-shot event, and it must be a JSON object.
-    if events.len() != 1 {
-        return None;
+    // Reduce the stream to a single terminal result, requiring every other
+    // event to be a droppable notification. Any unsafe event, or a second
+    // terminal, aborts (None).
+    let mut terminal: Option<Vec<u8>> = None;
+    for payload in &events {
+        match classify_event(payload) {
+            RpcEvent::Notification => {}
+            RpcEvent::Terminal(bytes) => {
+                if terminal.is_some() {
+                    return None; // more than one terminal response
+                }
+                terminal = Some(bytes);
+            }
+            RpcEvent::Unsafe => return None,
+        }
     }
-    let payload = events.into_iter().next()?;
-    serde_json::from_str::<Value>(&payload)
-        .ok()
-        .filter(Value::is_object)
-        .map(|_| payload.into_bytes())
+    terminal
 }
 
 /// True iff the response is a cacheable JSON-RPC success: parses as an object,
@@ -275,11 +335,11 @@ mod tests {
     }
 
     #[test]
-    fn extract_single_json_from_sse_event() {
+    fn extract_cacheable_json_from_sse_event() {
         // The exact shape a streamable-HTTP MCP server returns for a single-shot
         // result: one `event: message` block, one `data:` line.
         let body = b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"ok\":true}}\n\n";
-        let json = extract_single_json(body).expect("single event must extract");
+        let json = extract_cacheable_json(body).expect("single event must extract");
         let v: Value = serde_json::from_slice(&json).unwrap();
         assert_eq!(v["id"], serde_json::json!(3));
         assert_eq!(v["result"]["ok"], serde_json::json!(true));
@@ -288,39 +348,70 @@ mod tests {
     }
 
     #[test]
-    fn extract_single_json_passes_bare_json_through() {
+    fn extract_cacheable_json_passes_bare_json_through() {
         let body = br#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#;
-        let json = extract_single_json(body).expect("bare json object passes through");
+        let json = extract_cacheable_json(body).expect("bare json object passes through");
         assert_eq!(json, body.to_vec());
     }
 
     #[test]
-    fn extract_single_json_joins_multiline_data() {
+    fn extract_cacheable_json_joins_multiline_data() {
         // Per the SSE spec a single event's data can span consecutive data:
         // lines, joined by \n. This is still ONE event → one JSON payload.
         let body = b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\ndata: \"result\":{\"v\":2}}\n\n";
-        let json = extract_single_json(body).expect("multiline single event extracts");
+        let json = extract_cacheable_json(body).expect("multiline single event extracts");
         let v: Value = serde_json::from_slice(&json).unwrap();
         assert_eq!(v["result"]["v"], serde_json::json!(2));
     }
 
     #[test]
-    fn extract_single_json_rejects_multi_event_stream() {
-        // Progress notification + terminal result = a genuine multi-event stream.
-        // Never collapse it into one cached entry.
-        let body = b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progress\":0.5}}\n\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n";
-        assert!(extract_single_json(body).is_none());
+    fn extract_cacheable_json_multi_event_progress_then_result() {
+        // A "completed op that emitted progress" stream: one or more fire-and-
+        // forget progress notifications (method, NO id) followed by the single
+        // terminal result. The notifications are droppable on replay, so the
+        // terminal result IS cacheable — extract exactly it.
+        let body = b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progress\":0.3}}\n\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progress\":0.7}}\n\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n";
+        let json = extract_cacheable_json(body).expect("progress+result stream extracts terminal");
+        let v: Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(v["id"], serde_json::json!(1));
+        assert_eq!(v["result"]["ok"], serde_json::json!(true));
+        assert!(is_cacheable_response(&json));
     }
 
     #[test]
-    fn extract_single_json_rejects_non_object_payload() {
+    fn extract_cacheable_json_rejects_server_request_in_stream() {
+        // An interactive stream: the server issues a request (method + non-null
+        // id → sampling/elicitation/roots) that needs a client response before
+        // the terminal. Collapsing to a cached result would skip that
+        // round-trip, so the whole stream is unsafe → None.
+        let body = b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"sampling/createMessage\",\"params\":{}}\n\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n";
+        assert!(extract_cacheable_json(body).is_none());
+    }
+
+    #[test]
+    fn extract_cacheable_json_rejects_multiple_results() {
+        // Two terminal responses in one stream is ambiguous — never collapse.
+        let body = b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"a\":1}}\n\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"b\":2}}\n\n";
+        assert!(extract_cacheable_json(body).is_none());
+    }
+
+    #[test]
+    fn extract_cacheable_json_rejects_notifications_only() {
+        // A stream carrying only notifications and no terminal response is not a
+        // cacheable result.
+        let body = b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progress\":0.5}}\n\n";
+        assert!(extract_cacheable_json(body).is_none());
+    }
+
+    #[test]
+    fn extract_cacheable_json_rejects_non_object_payload() {
         // A data: line that isn't a JSON object (array / scalar / garbage).
         let arr = b"event: message\ndata: [1,2,3]\n\n";
         let scalar = b"event: message\ndata: 42\n\n";
         let garbage = b"event: message\ndata: not json\n\n";
-        assert!(extract_single_json(arr).is_none());
-        assert!(extract_single_json(scalar).is_none());
-        assert!(extract_single_json(garbage).is_none());
+        assert!(extract_cacheable_json(arr).is_none());
+        assert!(extract_cacheable_json(scalar).is_none());
+        assert!(extract_cacheable_json(garbage).is_none());
     }
 
     #[test]

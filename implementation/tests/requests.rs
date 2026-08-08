@@ -55,6 +55,7 @@ async fn setup_test() -> anyhow::Result<&'static TestSetup> {
             "tools": [
                 { "name": "read_only_search", "cacheable": true, "ttl": 60, "scope": "shared" },
                 { "name": "stream_search", "cacheable": true, "ttl": 60, "scope": "shared" },
+                { "name": "interactive_call", "cacheable": true, "ttl": 60, "scope": "shared" },
                 { "name": "whoami", "cacheable": true, "ttl": 60, "scope": "identity" }
             ],
             "maxEntries": 1000,
@@ -224,14 +225,14 @@ async fn sse_framed_discovery_miss_then_hit() -> anyhow::Result<()> {
 }
 
 #[pdk_test]
-async fn multi_event_sse_stream_not_cached() -> anyhow::Result<()> {
+async fn multi_event_progress_then_result_caches() -> anyhow::Result<()> {
     let setup = setup_test().await?;
 
-    // A genuine multi-event stream (progress notification + terminal result)
-    // must never be collapsed into a single cached entry. Both identical calls
-    // stay a miss and reach upstream. Scope by a dedicated allowlisted tool
-    // (`stream_search`) so this mock is mutually exclusive from every other
-    // test sharing this composite — matching on method + tool name.
+    // A "completed op that emitted progress" stream: fire-and-forget progress
+    // notifications (method, NO id) followed by the single terminal result.
+    // The terminal result IS cacheable — the notifications are dropped on
+    // replay. Second identical call is served from cache. Scoped by a dedicated
+    // allowlisted tool (`stream_search`) so the mock is mutually exclusive.
     let upstream = setup
         .mock_server
         .mock_async(|when, then| {
@@ -249,7 +250,65 @@ async fn multi_event_sse_stream_not_cached() -> anyhow::Result<()> {
 
     let client = reqwest::Client::new();
     let params = json!({ "name": "stream_search", "arguments": { "q": "hello" } });
-    for id in 30..=31 {
+
+    // First call: MISS — stream unwrapped, terminal result stored.
+    let first = client
+        .post(&setup.api_url)
+        .header("Content-Type", "application/json")
+        .body(rpc_request(30, "tools/call", params.clone()))
+        .send()
+        .await?;
+    assert_eq!(first.status(), 200);
+    assert_eq!(cache_header(&first).as_deref(), Some("miss"));
+    upstream.assert_hits_async(1).await;
+
+    // Second identical call: HIT — served from cache as a clean JSON-RPC object
+    // (the progress frames dropped), id re-stamped, upstream not re-hit.
+    let second = client
+        .post(&setup.api_url)
+        .header("Content-Type", "application/json")
+        .body(rpc_request(31, "tools/call", params))
+        .send()
+        .await?;
+    assert_eq!(second.status(), 200);
+    assert_eq!(cache_header(&second).as_deref(), Some("hit"));
+    upstream.assert_hits_async(1).await;
+
+    let body: serde_json::Value = second.json().await?;
+    assert_eq!(body["id"], json!(31), "terminal result re-stamped to live id");
+    assert_eq!(body["result"]["content"][0]["text"], json!("done"));
+    assert!(body.get("method").is_none(), "progress notification dropped from cached body");
+
+    Ok(())
+}
+
+#[pdk_test]
+async fn interactive_sse_stream_not_cached() -> anyhow::Result<()> {
+    let setup = setup_test().await?;
+
+    // An interactive stream: the server issues a request (method + non-null id
+    // — sampling/elicitation) that needs a client round-trip before the
+    // terminal. Collapsing to a cached result would skip that, so the stream
+    // is never cached: both identical calls stay a miss and reach upstream.
+    // Dedicated tool `interactive_call` keeps the mock mutually exclusive.
+    let upstream = setup
+        .mock_server
+        .mock_async(|when, then| {
+            when.method("POST")
+                .path("/")
+                .body_contains("\"method\":\"tools/call\"")
+                .body_contains("\"name\":\"interactive_call\"");
+            then.status(200)
+                .header("Content-Type", "text/event-stream")
+                .body(
+                    "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"sampling/createMessage\",\"params\":{}}\n\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"done\"}]}}\n\n",
+                );
+        })
+        .await;
+
+    let client = reqwest::Client::new();
+    let params = json!({ "name": "interactive_call", "arguments": { "q": "hi" } });
+    for id in 40..=41 {
         let resp = client
             .post(&setup.api_url)
             .header("Content-Type", "application/json")
