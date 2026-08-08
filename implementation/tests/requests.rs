@@ -53,7 +53,8 @@ async fn setup_test() -> anyhow::Result<&'static TestSetup> {
         .configuration(json!({
             "discovery": { "cacheable": true, "ttl": 60 },
             "tools": [
-                { "name": "read_only_search", "cacheable": true, "ttl": 60, "scope": "shared" }
+                { "name": "read_only_search", "cacheable": true, "ttl": 60, "scope": "shared" },
+                { "name": "whoami", "cacheable": true, "ttl": 60, "scope": "identity" }
             ],
             "maxEntries": 1000,
             "distributed": false
@@ -255,5 +256,193 @@ async fn allowlisted_tool_call_miss_then_hit() -> anyhow::Result<()> {
     assert_eq!(body["id"], json!(11));
     assert_eq!(body["result"]["content"][0]["text"], json!("result-body"));
 
+    Ok(())
+}
+
+#[pdk_test]
+async fn non_mcp_body_passes_through() -> anyhow::Result<()> {
+    let setup = setup_test().await?;
+
+    // A plain (non-JSON-RPC) POST body is not an MCP candidate: the policy must
+    // forward it untouched and mark the disposition bypass, never cache it.
+    let upstream = setup
+        .mock_server
+        .mock_async(|when, then| {
+            when.method("POST").path("/").body_contains("\"kind\":\"not-jsonrpc\"");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .body(json!({ "ok": true }).to_string());
+        })
+        .await;
+
+    let client = reqwest::Client::new();
+    for _ in 0..2 {
+        let resp = client
+            .post(&setup.api_url)
+            .header("Content-Type", "application/json")
+            .body(json!({ "kind": "not-jsonrpc", "hello": "world" }).to_string())
+            .send()
+            .await?;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(cache_header(&resp).as_deref(), Some("bypass"));
+    }
+    // Never cached → every request reaches upstream.
+    upstream.assert_hits_async(2).await;
+    Ok(())
+}
+
+#[pdk_test]
+async fn identity_scope_partitions_by_principal() -> anyhow::Result<()> {
+    let setup = setup_test().await?;
+
+    // `whoami` is an identity-scoped tool. Two different principals issuing the
+    // SAME arguments must NOT share a cache entry: each is a miss on first call.
+    let upstream = setup
+        .mock_server
+        .mock_async(|when, then| {
+            when.method("POST")
+                .path("/")
+                .body_contains("\"method\":\"tools/call\"")
+                .body_contains("\"name\":\"whoami\"");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .body(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": { "content": [ { "type": "text", "text": "who" } ] }
+                    })
+                    .to_string(),
+                );
+        })
+        .await;
+
+    let client = reqwest::Client::new();
+    let params = json!({ "name": "whoami", "arguments": {} });
+
+    // alice: first call miss, identical second call hit.
+    let a1 = client
+        .post(&setup.api_url)
+        .header("Content-Type", "application/json")
+        .header("x-forwarded-user", "alice")
+        .body(rpc_request(20, "tools/call", params.clone()))
+        .send()
+        .await?;
+    assert_eq!(cache_header(&a1).as_deref(), Some("miss"));
+    upstream.assert_hits_async(1).await;
+
+    let a2 = client
+        .post(&setup.api_url)
+        .header("Content-Type", "application/json")
+        .header("x-forwarded-user", "alice")
+        .body(rpc_request(21, "tools/call", params.clone()))
+        .send()
+        .await?;
+    assert_eq!(cache_header(&a2).as_deref(), Some("hit"));
+    upstream.assert_hits_async(1).await;
+
+    // bob: SAME arguments but a different principal → separate partition → miss,
+    // forwarding to upstream a second time.
+    let b1 = client
+        .post(&setup.api_url)
+        .header("Content-Type", "application/json")
+        .header("x-forwarded-user", "bob")
+        .body(rpc_request(22, "tools/call", params))
+        .send()
+        .await?;
+    assert_eq!(cache_header(&b1).as_deref(), Some("miss"));
+    upstream.assert_hits_async(2).await;
+
+    Ok(())
+}
+
+#[pdk_test]
+async fn max_entries_evicts_lru() -> anyhow::Result<()> {
+    // maxEntries eviction is a property of the local PDK Cache, so this test
+    // stands up its OWN composite with maxEntries=1 (distinct from the shared
+    // 1000-entry setup) and its own port.
+    let httpmock_config = HttpMockConfig::builder()
+        .port(80)
+        .version("latest")
+        .hostname("backend")
+        .build();
+
+    let policy_config = PolicyConfig::builder()
+        .name(POLICY_NAME)
+        .configuration(json!({
+            "discovery": { "cacheable": true, "ttl": 60 },
+            "tools": [
+                { "name": "a", "cacheable": true, "ttl": 60, "scope": "shared" },
+                { "name": "b", "cacheable": true, "ttl": 60, "scope": "shared" }
+            ],
+            "maxEntries": 1,
+            "distributed": false
+        }))
+        .build();
+
+    let api_config = ApiConfig::builder()
+        .name("mcp-api-evict")
+        .port(8186)
+        .path("/")
+        .upstream(&httpmock_config)
+        .policies([policy_config])
+        .build();
+
+    let flex_config = FlexConfig::builder()
+        .version("1.11.0")
+        .hostname("local-flex-evict")
+        .with_api(api_config)
+        .config_mounts([(POLICY_DIR, "policy"), (COMMON_CONFIG_DIR, "common")])
+        .build();
+
+    let composite = TestComposite::builder()
+        .with_service(flex_config)
+        .with_service(httpmock_config)
+        .build()
+        .await?;
+
+    let flex: Flex = composite.service()?;
+    let api_url = flex.external_url(8186).unwrap();
+    let backend: HttpMock = composite.service()?;
+    let mock_server = MockServer::connect_async(backend.socket()).await;
+
+    // One mock per tool so we can count hits independently.
+    let mock_a = mock_server
+        .mock_async(|when, then| {
+            when.method("POST").path("/").body_contains("\"name\":\"a\"");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .body(json!({"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"A"}]}}).to_string());
+        })
+        .await;
+    let mock_b = mock_server
+        .mock_async(|when, then| {
+            when.method("POST").path("/").body_contains("\"name\":\"b\"");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .body(json!({"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"B"}]}}).to_string());
+        })
+        .await;
+
+    let client = reqwest::Client::new();
+    let call_a = || rpc_request(1, "tools/call", json!({ "name": "a", "arguments": {} }));
+    let call_b = || rpc_request(1, "tools/call", json!({ "name": "b", "arguments": {} }));
+
+    // 1) a → miss (stored, cache now holds {a}).
+    let r = client.post(&api_url).header("Content-Type", "application/json").body(call_a()).send().await?;
+    assert_eq!(cache_header(&r).as_deref(), Some("miss"));
+    mock_a.assert_hits_async(1).await;
+
+    // 2) b → miss (maxEntries=1 evicts a; cache now holds {b}).
+    let r = client.post(&api_url).header("Content-Type", "application/json").body(call_b()).send().await?;
+    assert_eq!(cache_header(&r).as_deref(), Some("miss"));
+    mock_b.assert_hits_async(1).await;
+
+    // 3) a again → miss (was evicted) → forwards to upstream a SECOND time.
+    let r = client.post(&api_url).header("Content-Type", "application/json").body(call_a()).send().await?;
+    assert_eq!(cache_header(&r).as_deref(), Some("miss"));
+    mock_a.assert_hits_async(2).await;
+
+    std::mem::forget(composite);
     Ok(())
 }

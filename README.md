@@ -10,9 +10,12 @@ external dependency.**
 > **Status:** implemented. The full cache lookup/store lifecycle is in place —
 > MCP JSON-RPC parsing, SHA-256 keying, local and gossip-distributed backends,
 > discovery + allowlisted read-only `tools/call` caching, and the annotation
-> guardrail — covered by unit tests and by pdk-test integration tests against a
-> real Flex Gateway. See [`docs/architecture.md`](docs/architecture.md) for the
-> full design.
+> guardrail — covered by unit tests (the full `decide` decision matrix, both
+> cache backends, keying, and guardrails) and by pdk-test integration tests
+> against a real Flex Gateway (discovery miss→hit with `id` re-stamp, tool-call
+> miss→hit, `no-cache` bypass, non-MCP pass-through, identity-scope
+> partitioning, and `maxEntries` LRU eviction). See
+> [`docs/architecture.md`](docs/architecture.md) for the full design.
 
 ## Why
 

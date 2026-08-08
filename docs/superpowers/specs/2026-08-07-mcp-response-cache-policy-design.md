@@ -1,17 +1,10 @@
-# MCP Response Cache — Architecture
+# MCP Tool-Call Response Cache — Design
 
-> Delivers the P4A idea "MCP Tool-Call Response Cache"
-> (`8ce9e2c4-03e2-44cf-96b1-9cca946e0a60`); shipped under the display name
-> **MCP Response Cache**.
-
+- **Status:** Approved (architecture phase)
+- **Date:** 2026-08-07
+- **Idea:** MCP Tool-Call Response Cache (`8ce9e2c4-03e2-44cf-96b1-9cca946e0a60`)
 - **Target PDK:** 1.9.2 (common floor on crates.io `cargo-anypoint` and PDK release notes)
 - **Category:** MCP · `assetTypes: mcp` · `interfaceScope: api`
-
-> This document is the approved design for the policy, now fully implemented:
-> the cache lookup/store lifecycle described in §4–§5 is in place, covered by
-> unit tests and by pdk-test integration tests that exercise a real Flex
-> Gateway (discovery miss→hit, `cache-control: no-cache` bypass, and an
-> allowlisted read-only `tools/call` round-trip).
 
 ## 1. Problem & Goal
 
@@ -108,11 +101,11 @@ mcp-response-cache-policy/
 │   ├── tests/            # integration tests (pdk-test)
 │   └── src/
 │       ├── lib.rs        # entrypoint + request/response filters
-│       ├── mcp.rs        # JSON-RPC parse (request + response) + method
-│       │                 #   vocabulary + hit-response envelope builder
+│       ├── mcp.rs        # JSON-RPC envelope parse + MCP method vocabulary
 │       ├── key.rs        # canonicalize params + SHA-256 keying + scope
 │       ├── store.rs      # CacheStore trait + LocalStore + GossipStore
 │       ├── annotations.rs# observed tool annotations (defense-in-depth, §5)
+│       ├── errors.rs     # JSON-RPC error envelope helpers
 │       └── generated/    # config.rs (from gcl.yaml — do not hand-edit)
 └── docs/
 ```
@@ -246,22 +239,14 @@ at `configure()` for O(1) lookup).
 
 ## 8. Testing Strategy
 
-- **Unit (`pdk-unit`):** envelope parse (numeric/string/null `id`, malformed /
-  non-JSON-RPC), key canonicalization idempotence + value-sensitivity + scope
-  partitioning, the full `decide()` decision matrix (notification, unknown
-  method, discovery on/off/ttl-0, `tools/call` allowlist ×
-  cacheable × missing-name × observed-destructive, identity scope with/without
-  principal), response guardrails (`error`/`isError`/no-`result`), tool-safety
-  annotation extraction + observed-unsafe marker, `LocalStore` roundtrip + lazy
-  expiry eviction, and `GossipStore` roundtrip + first-writer-wins +
-  stale-without-tombstone + get-error-falls-open. Mock `Cache` and
-  `DataStorage`.
-- **Integration (`pdk-test`, Docker playground, run serially):**
-  discovery miss→store→hit with `id` re-stamp and upstream hit-count assertion
-  (hit does not reach backend); allowlisted read-only `tools/call` miss→hit;
-  `Cache-Control: no-cache` bypass; non-MCP body pass-through (never cached);
-  identity-scope partitioning by `x-forwarded-user` principal; `maxEntries`
-  LRU eviction (local backend, dedicated composite).
+- **Unit (`pdk-unit`):** envelope parse (numeric/string/null/malformed `id`),
+  key canonicalization idempotence + scope partitioning, guardrail matrix
+  (error/`isError`/SSE/non-allowlisted/destructive/no-cache), TTL expiry, `id`
+  re-stamping on hit, local-mode-no-control-plane resilience. `MockCacheStore`.
+- **Integration (`pdk-test`, Docker playground):** miss→store→hit round-trip,
+  upstream hit-count assertion (hit does not reach backend), `maxEntries`
+  eviction (local), bypass header, discovery TTL, per-tool scope isolation,
+  distributed backend smoke.
 
 ## 9. Non-Goals (v1)
 
